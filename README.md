@@ -28,26 +28,51 @@ away, whether it was stopped here or died on its own.
 
 ## Install
 
-The plugin has to be linked into Tern, because it lives in a directory of its
-own rather than in Tern's own plugin folder:
-
 ```sh
-tern plugin link "D:/path/to/tern-dsh-web"
+tern plugin install https://github.com/meisijiya/tern-dsh-web
 ```
 
-Then reload it:
+`tern plugin install` copies the package into Tern's plugins directory
+(`tern plugin dir`, `%APPDATA%\Tern\plugins` on Windows) and reloads. The
+plugin then loads in **every** window, whatever directory that window was
+opened in — Tern loads its plugins directory globally, not per project.
+
+Confirm it took:
 
 ```sh
-tern plugin reload
+tern plugin list      # must end with "ready"
 ```
 
-`tern plugin list` prints `dsh-web 1.0.0 DSH Web` once Tern has claimed it.
-
-To unlink:
+To remove it:
 
 ```sh
-tern plugin unlink dsh-web
+tern plugin remove dsh-web
 ```
+
+## Working on it
+
+The repository is the source; Tern's plugins directory holds an **installed
+copy**. They are two separate trees, and the copy is what actually runs. So a
+change needs two steps:
+
+```sh
+# 1. edit the repository, then commit
+git add -A && git commit -m "fix: ..."
+
+# 2. push the change into Tern's plugins directory
+tern plugin install "D:/path/to/tern-dsh-web" --force
+```
+
+`--force` replaces an installed copy. Without it the command refuses to touch
+one that is already there.
+
+The repository keeps only sources. Nothing is written into it at runtime: the
+server's log and any plugin state live under Tern's own plugin-data directory.
+
+**Do not develop this with `tern plugin link`.** Linking runs the directory in
+place instead of copying it, which makes it ambiguous which tree a running
+window is using, and it records an absolute path that breaks the moment the
+directory moves or the machine changes. Edit the repository, install the copy.
 
 ## Requirements
 
