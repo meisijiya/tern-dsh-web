@@ -1,0 +1,8 @@
+schema = 1
+id = "dsh-web"
+name = "DSH Web"
+version = "1.0.0"
+description = "Starts the DeepSeek Harness Web UI on demand and opens it in a browser block."
+icon = "md-web"
+
+window = "main.luau"

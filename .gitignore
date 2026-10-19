@@ -1,0 +1,11 @@
+# Nothing generated at runtime belongs here: the plugin keeps its state under
+# Tern's own plugin-data directory, not in its source tree.
+
+# A token pasted into the plugin dir by mistake.
+.env
+*.key
+secrets.luau
+
+# Luau / editor
+*.bak
+.cache/
