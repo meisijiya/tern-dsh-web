@@ -10,61 +10,54 @@
 //   to stdout only, and without that token the Web UI opens an address that
 //   answers 401.
 //
-// Running `npx ...` through a shell loses the output. npx is a `.cmd` shim whose
-// body chains commands with `&`, and that swallows a redirect the way it would
-// swallow anything else on the line. So no command line is built here: npx is
-// used only to resolve and populate the package cache, and the server is then
-// started as the real `node` entry point behind it.
+// The package is the globally installed one: `npm i -g @deepseek-ai/dsh`. That
+// is the same copy the `dsh` command runs, so `dsh plugin add …` in a terminal
+// and the server this launches can never be two different versions — which is
+// exactly what happened while an npx cache copy sat alongside it, since nothing
+// tied the two lifetimes together.
+//
+// The entry point is started through `node` rather than through the `dsh.cmd`
+// shim: a shim chains its commands with `&`, which swallows a stdout redirect,
+// and the launch URL has to survive to be read back.
 
 import { spawn, spawnSync } from "node:child_process";
-import { accessSync, closeSync, mkdirSync, openSync, readdirSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { accessSync, closeSync, mkdirSync, openSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-const [, , rawArgs, logPath, spec] = process.argv;
+const [, , rawArgs, logPath] = process.argv;
 
 // Kept as a string so the argument vector survives the boundary unchanged: the
 // caller splits it, and DSH reads its flags positionally.
 const args = rawArgs === "" ? [] : rawArgs.split(" ");
 
-if (rawArgs === undefined || !logPath || !spec) {
-  console.error("usage: launch.mjs <args> <log-path> <npm-spec>");
+if (rawArgs === undefined || !logPath) {
+  console.error("usage: launch.mjs <args> <log-path>");
   process.exit(2);
 }
 
 mkdirSync(dirname(logPath), { recursive: true });
 
-// Resolution only. A first run downloads the package here, which is why this is
-// a separate, synchronous step instead of being folded into the server launch.
-const resolved = spawnSync("npx", ["-y", spec, "--version"], {
-  stdio: ["ignore", "ignore", "pipe"],
-  shell: true,
-  windowsHide: true,
-  encoding: "utf8",
-});
+// The log file is created before the package is resolved, so a launcher that
+// cannot find DSH says so there — the plugin reads this same file to explain a
+// failed start, and an absent file leaves it with nothing to report.
+const fd = openSync(logPath, "w");
 
-if (resolved.status !== 0) {
-  console.error(
-    "could not resolve " + spec + ": " + (resolved.stderr || "").trim(),
-  );
-  process.exit(1);
-}
-
-// npx caches by exact spec under a content-addressed directory, so the entry
-// point is whichever cached copy is most recent.
-const bin = findEntryPoint(spec);
+const bin = findEntryPoint();
 if (!bin) {
-  console.error("resolved " + spec + " but found no entry point in the npx cache");
+  const message =
+    "dsh-web-launcher: @deepseek-ai/dsh is not installed globally — " +
+    "run `npm i -g @deepseek-ai/dsh`, then start DSH Web again";
+  writeFileSync(logPath, message + "\n");
+  closeSync(fd);
+  console.error(message);
   process.exit(1);
 }
 
 // stdout and stderr are the log file's own descriptor. The child inherits it,
 // so the log keeps being written after this process is gone — which matters
-// because the URL is printed once the server is listening, minutes after a first
-// run starts downloading. Piping instead cannot work: a detached child does not
+// because the URL is printed once the server is listening, long after the
+// launcher returned. Piping instead cannot work: a detached child does not
 // hand its pipes to a parent that has already exited.
-const fd = openSync(logPath, "w");
-
 const child = spawn(process.execPath, [bin, ...args], {
   detached: true,
   windowsHide: true,
@@ -80,45 +73,61 @@ child.unref();
 // Close our copy without closing the child's; both hold the same descriptor.
 closeSync(fd);
 
-function findEntryPoint(npmSpec) {
-  // `@deepseek-ai/dsh@latest` names a version range; the cache directory is
-  // named after the bare package, so the range is dropped before looking.
-  const spec = npmSpec.replace(/@[^@/]*$/, "");
+function findEntryPoint() {
+  for (const root of globalRoots()) {
+    const candidate = join(root, "@deepseek-ai", "dsh", "lib", "bin.js");
+    try {
+      accessSync(candidate);
+      return candidate;
+    } catch {
+      // Not this global root's copy of the package.
+    }
+  }
+  return null;
+}
 
-  // npm's cache is configurable, and `npm_config_cache` is not exported into
-  // ordinary processes, so npm itself is asked where it keeps things. Guessing
-  // the default would silently pick a different cache than the one npx just
-  // populated — and a cache directory npx never writes to.
-  const cache = spawnSync("npm", ["config", "get", "cache"], {
+// npm owns where a global install lands and the answer differs per machine and
+// per version manager, so npm is asked rather than guessed. `npm_config_prefix`
+// is not exported into ordinary processes either, so reading the environment
+// would be as likely to be undefined as the cache path it replaced.
+function globalRoots() {
+  const roots = [];
+  const add = (dir) => {
+    // npm can fail outright — no npm on PATH at all — and a null root would
+    // then reach `join` and take the launcher down instead of letting it
+    // report that DSH is not installed.
+    if (typeof dir === "string" && dir !== "" && !roots.includes(dir)) {
+      roots.push(dir);
+    }
+  };
+
+  // `npm root -g` is the global `node_modules` itself.
+  add(npmOutput(["root", "-g"]));
+
+  // `npm prefix -g` is one level above it on Windows, where a `-g` install puts
+  // packages under `<prefix>\node_modules` while the prefix itself holds the
+  // bin shims. Kept as a second root so a prefix that reports something other
+  // than what `root` did still resolves.
+  const prefix = npmOutput(["prefix", "-g"]);
+  if (prefix !== null) {
+    add(join(prefix, "node_modules"));
+  }
+
+  return roots;
+}
+
+function npmOutput(npmArgs) {
+  // On Windows `npm` is an `npm.cmd` shim, so it needs the shell to be found;
+  // a bare name fails with "program not found".
+  const result = spawnSync("npm", npmArgs, {
     stdio: ["ignore", "pipe", "ignore"],
     shell: true,
     windowsHide: true,
     encoding: "utf8",
-  }).stdout?.trim();
+  });
 
-  const root = join(cache || join(homedir(), "AppData", "Local", "npm-cache"), "_npx");
-
-  let entries;
-  try {
-    entries = readdirSync(root);
-  } catch {
+  if (result.status !== 0) {
     return null;
   }
-
-  let newest = null;
-  let newestTime = -1;
-  for (const dir of entries) {
-    const candidate = join(root, dir, "node_modules", ...spec.split("/"), "lib", "bin.js");
-    try {
-      accessSync(candidate);
-      const time = statSync(candidate).mtimeMs;
-      if (time > newestTime) {
-        newestTime = time;
-        newest = candidate;
-      }
-    } catch {
-      // Not this directory's copy of the package.
-    }
-  }
-  return newest;
+  return result.stdout?.trim() ?? null;
 }

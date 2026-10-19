@@ -19,8 +19,10 @@ When the server is stopped, the menu offers only what applies:
   browser block. An already-healthy browser block is reused rather than stacked.
 - **Restart** — stops the server and starts it again.
 - **Stop** — stops the server and releases the port.
-- **Up to date** — shows the installed and the latest published version. A
-  newer version available is marked with `↑` on the segment.
+- **Update to x.y.z** — stops the server, runs `npm i -g @deepseek-ai/dsh@x.y.z`,
+  and starts it again on the new version. A newer version available is marked
+  with `↑` on the segment.
+- **Up to date** — shows the installed and the latest published version.
 
 The status line reflects what is actually listening on the port: the segment
 turns from `DSH running` back to `DSH` within seconds of the server going
@@ -77,17 +79,40 @@ directory moves or the machine changes. Edit the repository, install the copy.
 ## Requirements
 
 - Node.js on `PATH` — the plugin starts the server with `node`.
-- npm — it is used to resolve the package and to find npm's cache directory.
+- npm — it is asked where the global install lives.
+- **A global install of DSH**, which is what the server runs:
 
-The server is the published package `@deepseek-ai/dsh`. The first launch
-downloads it, which takes a few minutes; later launches reuse the cache.
+```sh
+npm i -g @deepseek-ai/dsh
+```
+
+There is no bundled or cached copy. The same install is what the `dsh` command
+in your terminal runs, so a plugin you add with `dsh plugin add …` and the host
+that loads it are always the same version of DSH. If the package is missing,
+the plugin says so in a toast and leaves the server stopped rather than
+downloading a second copy behind your back.
+
+## Managing plugins
+
+The server keeps its plugins in a profile, and the CLI addresses them by name:
+
+```sh
+dsh plugin --profile web add dshmarket     # a plugin, e.g. the marketplace
+dsh plugin --profile web list              # what is installed
+dsh plugin --profile web remove dshmarket
+```
+
+`--profile web` matches the server this plugin starts. Run these from a
+terminal rather than from inside DSH itself, so a half-installed plugin cannot
+take the agent down with it. A new plugin is picked up after a restart —
+**Restart** in the menu.
 
 ## Where things live
 
 | Path | What |
 |---|---|
 | `<tern plugin data>/dsh-web/dsh-web.log` | The server's stdout. Its first line is the access URL, with the token. |
-| `$(npm config get cache)/_npx/<hash>/` | The downloaded package. The hash differs per version range, so `@latest` picks up new releases. |
+| `$(npm root -g)/@deepseek-ai/dsh/` | The server. The same directory the `dsh` command resolves to. |
 
 The log is truncated on every launch and removed on stop, so the token of a
 stopped server can never be read back by mistake. The token changes on every
@@ -102,9 +127,14 @@ the menu's **Stop**.
 
 That is also why the token is read out of a log file rather than taken from
 the process's output. `dsh web` prints its access URL — with a token — to
-stdout only, and prints it once the server is listening, which on a first run
-is minutes after the launch. The child process inherits the log file's own
+stdout only, and prints it once the server is listening, which is later than
+the launcher has returned. The child process inherits the log file's own
 descriptor, so the output keeps being written after the launcher is gone.
+
+The global package is started as `node <npm root -g>/@deepseek-ai/dsh/lib/bin.js`
+rather than through the `dsh.cmd` shim. A `.cmd` shim chains its commands with
+`&`, which swallows a stdout redirect, and that redirect is the only way the
+token gets recorded.
 
 ## Troubleshooting
 
@@ -112,9 +142,13 @@ descriptor, so the output keeps being written after the launcher is gone.
 holds port 3080. The menu reports it as blocked and refuses to start, because
 starting anyway would fail with a confusing error.
 
-**A start fails with "gave up waiting".** The first launch downloads the
-package; the log says how far it got. `dsh web` also writes its own logs
-under `~/.dsh/`.
+**A start fails with "gave up waiting".** The log says why. `@deepseek-ai/dsh`
+not installed globally is the usual case, and the message says so. `dsh web`
+also writes its own logs under `~/.dsh/`.
+
+**An update fails.** The server is left stopped rather than restarted on a
+half-written install — run `npm i -g @deepseek-ai/dsh@<version>` yourself, see
+what npm says, then start again.
 
 **The version check says "checking…" forever.** The registry request failed.
 The reason is shown in the toast.

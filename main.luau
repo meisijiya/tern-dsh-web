@@ -14,35 +14,32 @@ local ORIGIN = "http://127.0.0.1:3080"
 local REGISTRY = "https://registry.npmjs.org/@deepseek-ai/dsh/latest"
 local TOKEN_URL = "http://127%.0%.0%.1:3080/%?token=%S+"
 
--- `@latest` rather than the bare spec: npx keys its install cache by the exact
--- spec, so a bare `@deepseek-ai/dsh` stays pinned to whatever it first resolved
--- and no published update would ever be picked up. Naming the version range
--- makes a new release land in a fresh cache directory on the next launch.
---
--- `-y` is required: without it npx asks "Ok to proceed? (y)" on the first
--- install, and nothing in a non-interactive pane ever answers it.
-local SPEC = "@deepseek-ai/dsh@latest"
-
--- The server's own arguments. npx is only used to resolve the package, never to
--- run it: a `.cmd` shim chains its commands with `&`, which swallows a stdout
--- redirect, and the launch URL has to survive to be read back.
+-- The server's own arguments. The package is started through `node <bin.js>`
+-- rather than through the `dsh.cmd` shim: a shim chains its commands with `&`,
+-- which swallows a stdout redirect, and the launch URL has to survive to be read
+-- back.
 local SERVER_ARGS = { "web", "--no-open" }
 
 -- Where the detached server's stdout lands. Truncated on every launch so a
 -- token from a previous run can never be mistaken for this one's.
 local LOG_PATH = tern.plugin.data .. "/dsh-web.log"
 
--- launch.mjs resolves the package, then starts the server as a detached
--- `node` process with the log file as its own stdout descriptor. It comes back
--- as soon as the server is detached; the server itself outlives every pane, the
--- window and this plugin.
+-- The package the server runs, and the one a `dsh plugin add …` in a terminal
+-- installs into: one global copy, so the plugin the user manages and the host
+-- that loads it can never be two different versions.
+local PACKAGE = "@deepseek-ai/dsh"
+
+-- launch.mjs locates that global package, then starts it as a detached `node`
+-- process with the log file as its own stdout descriptor. It comes back as soon
+-- as the server is detached; the server itself outlives every pane, the window
+-- and this plugin.
 --
--- Its timeout has to cover a first run's download, since the resolution step is
--- synchronous and happens before the spawn.
+-- Its timeout has to cover a first start, since locating the package is a
+-- synchronous `npm root -g` before the spawn.
 local LAUNCHER = tern.plugin.dir .. "/launch.mjs"
 
 local function launch_argv()
-	return { "node", LAUNCHER, table.concat(SERVER_ARGS, " "), LOG_PATH, SPEC }
+	return { "node", LAUNCHER, table.concat(SERVER_ARGS, " "), LOG_PATH }
 end
 
 local PROBE_TIMEOUT_MS = 1_500
@@ -187,6 +184,13 @@ local function diagnose_failure()
 	if body == nil then
 		return "the launcher produced no output — see " .. LOG_PATH
 	end
+	-- The launcher writes its own failures with this prefix, so a launch that
+	-- never reached the server says why instead of "gave up waiting".
+	for line in string.gmatch(body .. "\n", "([^\n]*)\n") do
+		if string.find(line, "dsh-web-launcher:", 1, true) == 1 then
+			return trim(string.sub(line, #"dsh-web-launcher: "))
+		end
+	end
 	if string.find(body, "EADDRINUSE", 1, true) ~= nil then
 		return "port 3080 is already taken by another process"
 	end
@@ -245,7 +249,7 @@ local function launch(cx)
 	-- time the launcher returns.
 	tern.process.run(launch_argv(), { timeout_ms = READY_MS })
 
-	cx:toast("info", "Starting DSH Web", "the first run downloads the package, which takes minutes")
+	cx:toast("info", "Starting DSH Web", "waiting for it to answer on " .. ORIGIN)
 
 	wait_until_ready(tern.now() + READY_MS, function(readyCx)
 		state.busy = false
@@ -259,15 +263,12 @@ end
 
 ------------------------------------------------------------------- stopping
 
--- The server is started as `node <cache>/.../@deepseek-ai/dsh/lib/bin.js`, so
--- the entry point is what identifies it. Matching the package name alone is not
--- enough on its own: `npx -y @deepseek-ai/dsh@latest` is a `.cmd` shim that
--- spells the package with forward slashes while the entry point spells it with
--- Windows backslashes, and matching only one of the two kills the wrapper and
--- leaves the real server holding the port.
---
--- Either spelling is therefore accepted, and the node that owns the entry point
--- is the one that has to die.
+-- The server is started as `node <global>/node_modules/@deepseek-ai/dsh/lib/bin.js`,
+-- so the entry point is what identifies it. Both slash spellings are accepted
+-- because the same path reaches Windows differently depending on which tool
+-- spelled it — npm's shims and error messages use forward slashes, a resolved
+-- `node_modules` path uses backslashes — and matching only one of the two leaves
+-- the real server holding the port.
 local function names_the_package(arg)
 	if string.find(arg, "@deepseek-ai", 1, true) == nil then
 		return false
@@ -386,28 +387,26 @@ local function fetch_latest(onDone)
 	end)
 end
 
--- The installed version is read out of npm's own npx cache rather than by
--- running the CLI: `npx <spec> --version` for a spec that is not cached yet
--- downloads the whole package, so a version check would cost the same 464 MB as
--- a first launch. Every cached `@deepseek-ai/dsh` is read instead, and their
--- set answers the only question that matters — is the published version already
--- on disk.
+-- The installed version is read out of the global install's package.json rather
+-- than by running the CLI: `npm i -g` for a version that is not installed yet
+-- re-downloads and rewrites the very copy the running server was started from,
+-- so a version check would be an update in disguise.
 --
 -- On Windows `npm` is an `npm.cmd` shim, so it is spawned through `cmd /c`; a
 -- bare name fails with "program not found".
-local cache_dir_resolved = false
+local global_root_resolved = false
 
-local function npm_cache_dir(onDone)
-	local cached = tern.kv.get("npm_cache")
-	if cache_dir_resolved then
+local function npm_global_root(onDone)
+	local cached = tern.kv.get("npm_global_root")
+	if global_root_resolved then
 		onDone(cached)
 		return
 	end
-	cache_dir_resolved = true
+	global_root_resolved = true
 
 	local argv = tern.runtime.os == "windows"
-		and { "cmd", "/c", "npm", "config", "get", "cache" }
-		or { "npm", "config", "get", "cache" }
+		and { "cmd", "/c", "npm", "root", "-g" }
+		or { "npm", "root", "-g" }
 
 	tern.process.run(argv, { timeout_ms = PROCESS_TIMEOUT_MS }, function(result, _, procCx)
 		if result == nil or result.status ~= 0 then
@@ -419,7 +418,7 @@ local function npm_cache_dir(onDone)
 			onDone(cached)
 			return
 		end
-		tern.kv.set("npm_cache", dir)
+		tern.kv.set("npm_global_root", dir)
 		onDone(dir)
 	end)
 end
@@ -480,55 +479,37 @@ local function newer(a, b)
 	return nil
 end
 
--- Every `@deepseek-ai/dsh` npx has cached.
-local function cached_versions(onDone)
-	npm_cache_dir(function(dir)
-		local versions = {}
-		if dir == nil then
-			onDone(versions)
+-- The version of the one copy the server runs, or nil when there is none yet.
+local function installed_version(onDone)
+	npm_global_root(function(root)
+		if root == nil then
+			onDone(nil)
 			return
 		end
-		local base = dir .. "/_npx"
-		local ok, entries = pcall(tern.fs.list, base)
-		if not ok or type(entries) ~= "table" then
-			onDone(versions)
+		local manifest = root .. "/@deepseek-ai/dsh/package.json"
+		if not tern.fs.exists(manifest) then
+			onDone(nil)
 			return
 		end
-		for _, entry in ipairs(entries) do
-			local manifest = base .. "/" .. entry .. "/node_modules/@deepseek-ai/dsh/package.json"
-			if tern.fs.exists(manifest) then
-				local read = tern.fs.read(manifest, 65536)
-				local decoded, payload = pcall(tern.json.decode, read or "")
-				if decoded and type(payload) == "table" and type(payload.version) == "string" then
-					versions[#versions + 1] = payload.version
-				end
-			end
+		local read = tern.fs.read(manifest, 65536)
+		local decoded, payload = pcall(tern.json.decode, read or "")
+		if decoded and type(payload) == "table" and type(payload.version) == "string" then
+			onDone(payload.version)
+		else
+			onDone(nil)
 		end
-		onDone(versions)
 	end)
 end
 
-local function settle_update(latest, cached)
+local function settle_update(latest, installed)
 	state.latest = latest
-	state.cached = cached
-
-	local best = nil
-	for _, version in ipairs(cached) do
-		best = newer(version, best) or best
-	end
-	state.installed = best
-
-	local have = false
-	for _, version in ipairs(cached) do
-		if version == latest then
-			have = true
-			break
-		end
-	end
+	state.installed = installed
 
 	if latest == nil then
 		state.update = nil
-	elseif have then
+	elseif newer(latest, installed) == nil then
+		-- Equal, or the installed copy is ahead of the published tag — a
+		-- prerelease the registry already points at. Nothing to install.
 		state.update = ""
 	else
 		state.update = latest
@@ -547,8 +528,8 @@ local function check_update(announce, onVerdict)
 			end
 			return
 		end
-		cached_versions(function(cached)
-			settle_update(latest, cached)
+		installed_version(function(installed)
+			settle_update(latest, installed)
 			if onVerdict ~= nil then
 				onVerdict(true)
 			end
@@ -577,10 +558,43 @@ local function cached_check()
 	check_update(false, nil)
 end
 
--- Updating is stop-then-start: `@latest` in the launch spec makes the next
--- start resolve the newer release instead of the pinned cache entry.
+-- Updating is install-then-restart, and the order is the point: the global
+-- copy is the one the running server was started from, so it has to be replaced
+-- with the server stopped rather than underneath it.
 local function update(cx)
-	stop(cx, launch)
+	local target = state.update
+
+	stop(cx, function(stopCx)
+		state.busy = true
+
+		local tail = { PACKAGE .. "@" .. target, "--no-audit", "--no-fund" }
+		local argv = tern.runtime.os == "windows"
+			and { "cmd", "/c", "npm", "i", "-g", tail[1], tail[2], tail[3] }
+			or { "npm", "i", "-g", tail[1], tail[2], tail[3] }
+
+		stopCx:toast("info", "Installing DSH " .. target, "a global install replaces the copy the server runs")
+
+		tern.process.run(argv, { timeout_ms = READY_MS }, function(result, _, procCx)
+			state.busy = false
+
+			if result == nil or result.status ~= 0 then
+				mark(STOPPED)
+				local why = result == nil and "npm did not run" or trim(result.stderr or "")
+				procCx:toast(
+					"error",
+					"Could not install DSH " .. target,
+					(why ~= "" and why or "npm exited with " .. tostring(result.status))
+						.. " — DSH Web is stopped"
+				)
+				return
+			end
+
+			state.installed = target
+			state.update = ""
+			refresh()
+			launch(procCx)
+		end)
+	end)
 end
 
 ---------------------------------------------------------------------- menu
@@ -725,11 +739,10 @@ sync_phase()
 -- The phase under test is captured now, not read back from `state`, so the
 -- poll cannot mistake a transition it did not observe for a dead server.
 local function watch()
-	-- While a start or a stop is in flight the port is expected to be
-	-- unreachable, and that is not evidence of anything: a first run can spend
-	-- minutes downloading with nothing listening. Reading the phase back here
-	-- would rewrite "starting" as "stopped" and then let a second start race
-	-- the first.
+	-- While a start, a stop or an update is in flight the port is expected to be
+	-- unreachable, and that is not evidence of anything: the busier of these can
+	-- hold it closed for minutes. Reading the phase back here would rewrite
+	-- "starting" as "stopped" and then let a second start race the first.
 	if state.busy then
 		return
 	end
