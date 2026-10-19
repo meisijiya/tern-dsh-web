@@ -10,9 +10,10 @@
 -- stdout and nowhere else, so the launch redirects stdout to a log file and the
 -- token is read back out of that.
 
-local ORIGIN = "http://127.0.0.1:3080"
+local PORT = 3080
+local ORIGIN = "http://127.0.0.1:" .. PORT
 local REGISTRY = "https://registry.npmjs.org/@deepseek-ai/dsh/latest"
-local TOKEN_URL = "http://127%.0%.0%.1:3080/%?token=%S+"
+local TOKEN_URL = "http://127%.0%.0%.1:" .. PORT .. "/%?token=%S+"
 
 -- The server's own arguments. The package is started through `node <bin.js>`
 -- rather than through the `dsh.cmd` shim: a shim chains its commands with `&`,
@@ -47,6 +48,8 @@ local POLL_MS = 700
 local READY_MS = 600_000
 -- How often to re-check a phase this window did not change itself.
 local HEARTBEAT_MS = 15_000
+local HOLDER_TIMEOUT_MS = 8_000
+local FREE_MAX_ROUNDS = 25
 local STOP_POLL_MS = 400
 local STOP_MAX_ROUNDS = 25
 local FETCH_TIMEOUT_MS = 10_000
@@ -60,6 +63,8 @@ local state = {
 	blocked = nil,
 	-- Set while a start or a stop is in flight, so the heartbeat leaves it alone.
 	busy = false,
+	-- The process holding the port, when it is not DSH.
+	holder = nil,
 	-- nil = not looked yet, "" = up to date, otherwise the newer version.
 	update = nil,
 	installed = nil,
@@ -97,7 +102,7 @@ local function probe(up, down, busy)
 		if result.status == 401 then
 			up(fetchCx)
 		else
-			busy(fetchCx, "port 3080 answers HTTP " .. result.status .. " — that is not the DSH Web UI")
+			busy(fetchCx, "port " .. PORT .. " answers HTTP " .. result.status .. " — that is not the DSH Web UI")
 		end
 	end)
 end
@@ -192,7 +197,7 @@ local function diagnose_failure()
 		end
 	end
 	if string.find(body, "EADDRINUSE", 1, true) ~= nil then
-		return "port 3080 is already taken by another process"
+		return "port " .. PORT .. " is already taken by another process"
 	end
 	for line in string.gmatch(body .. "\n", "([^\n]*)\n") do
 		if string.find(line, "startup failed", 1, true) ~= nil then
@@ -291,6 +296,186 @@ local function dsh_pids(list)
 		end
 	end
 	return pids
+end
+
+------------------------------------------------- whoever else owns the port
+
+-- A blocked port is one of two situations. Either a DSH survived Stop, which the
+-- process match already covers. Or something that is not DSH holds the socket: a
+-- leftover helper whose parent died, another tool, a second server. The port's
+-- answer does not say which -- DSH answers 401 and a stranger answers 200, but
+-- that is one data point, not an identity -- so the holder is looked up in the
+-- OS and shown to the user by name.
+--
+-- Tern cannot answer this itself: ProcessInfo carries no ports and ProcessQuery
+-- has no port filter, and its inventory is the plugin's process view, which need
+-- not include something started outside Tern. holder.ps1 does the lookup.
+local HOLDER_SCRIPT = tern.plugin.dir .. "/holder.ps1"
+
+local function parse_holder(stdout)
+	local holder = nil
+	for line in string.gmatch(stdout or "", "[^\r\n]+") do
+		local key, value = string.match(line, "^([A-Z]+)=(.*)$")
+		if key ~= nil then
+			if holder == nil then
+				holder = {}
+			end
+			holder[key] = trim(value)
+		end
+	end
+	return holder
+end
+
+-- "recovery.js -- .../dshmarket/lib/recovery.js" is more use than the whole
+-- command line: a hundred characters of a temporary recovery path tells the user
+-- nothing at a glance that its name does not.
+local function holder_label(holder)
+	local name = holder.NAME or "?"
+	local cmd = holder.CMD or ""
+	local base = name:match("[^\\/]+$") or name
+
+	local script = cmd:match("([^\\/]+%.js)%s") or cmd:match("([^\\/]+%.exe)%s")
+	if script ~= nil and script ~= base then
+		return base .. "  --  " .. script
+	end
+	return base
+end
+
+-- `onFree` covers both "nothing is listening" and "the holder exited between the
+-- two lookups inside the script": for the caller they are the same outcome, and
+-- the common case is that race rather than a genuinely free port.
+local function query_holder(cx, onFound, onFree)
+	if tern.runtime.os ~= "windows" then
+		onFree(cx)
+		return
+	end
+
+	local argv = {
+		"powershell",
+		"-NoProfile",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-File",
+		HOLDER_SCRIPT,
+		tostring(PORT),
+	}
+
+	tern.process.run(argv, { timeout_ms = HOLDER_TIMEOUT_MS }):next(function(result, _, runCx)
+		if result == nil or result.status ~= 0 then
+			onFree(runCx)
+			return
+		end
+		local holder = parse_holder(result.stdout)
+		if holder == nil or tonumber(holder.PID) == nil then
+			onFree(runCx)
+			return
+		end
+		onFound(runCx, holder)
+	end)
+end
+
+-- Every route into the blocked state goes through here, so the holder is looked
+-- up once and the menu can name it instead of leaving the user to find out
+-- through the task manager.
+local function enter_blocked(cx, why, toastTitle)
+	mark(BLOCKED)
+	state.blocked = why
+	query_holder(cx, function(heldCx, holder)
+		state.holder = holder
+		refresh()
+	end, function()
+		state.holder = nil
+	end)
+	if toastTitle ~= nil then
+		cx:toast("error", toastTitle, why)
+	end
+end
+
+-- Killing whatever holds the port is destructive to something this plugin did
+-- not start, so it is never done unasked: the name and the PID are shown first,
+-- and declining leaves everything alone.
+local function free_port_and_restart(cx)
+	state.busy = true
+
+	query_holder(cx, function(foundCx, holder)
+		local pid = tonumber(holder.PID)
+		if pid == nil then
+			state.busy = false
+			foundCx:toast("error", "Could not read the port holder", holder.PID)
+			return
+		end
+
+		state.holder = holder
+
+		foundCx:pick({
+			placeholder = "Kill pid " .. pid .. "?",
+			icon = "md-alert",
+			items = {
+				{
+					label = "Kill it and start DSH Web",
+					icon = "md-power",
+					act = "yes",
+					detail = holder_label(holder),
+				},
+				{ label = "Leave it alone", icon = "md-close", act = "no" },
+			},
+		}):next(function(choice, _, pickCx)
+			if choice == nil or choice.act ~= "yes" then
+				state.busy = false
+				return
+			end
+
+			-- Escalate the way Stop does: ask politely, then insist. The loop ends
+			-- by giving up rather than by starting anyway, because starting into a
+			-- held port is the failure this exists to prevent.
+			local attempts = 0
+			local function signal_and_wait(sigCx)
+				if attempts > FREE_MAX_ROUNDS then
+					state.busy = false
+					state.holder = nil
+					mark(STOPPED)
+					sigCx:toast(
+						"error",
+						"Port " .. PORT .. " is still held",
+						"pid " .. pid .. " survived -- stopped instead of starting into it"
+					)
+					return
+				end
+
+				-- It can exit on its own between the lookup and the signal, which is
+				-- the outcome that was wanted.
+				pcall(function()
+					sigCx.procs:signal(pid, attempts == 0 and "terminate" or "kill")
+				end)
+				attempts += 1
+
+				tern.timer(STOP_POLL_MS, function(pollCx)
+					query_holder(pollCx, function()
+						-- Still there: go round again with a harder signal.
+						signal_and_wait(pollCx)
+					end, function(freeCx)
+						state.busy = false
+						state.holder = nil
+						if tern.fs.exists(LOG_PATH) then
+							tern.fs.remove(LOG_PATH)
+						end
+						mark(STOPPED)
+						launch(freeCx)
+					end)
+				end)
+			end
+
+			signal_and_wait(pickCx)
+		end)
+	end, function(freeCx)
+		-- Nothing there after all: the holder exited between the probe that said
+		-- blocked and this lookup, which is the common case rather than an error.
+		state.busy = false
+		state.holder = nil
+		mark(STOPPED)
+		freeCx:toast("info", "Port " .. PORT .. " is free now", "starting DSH Web")
+		launch(freeCx)
+	end)
 end
 
 -- Stopping has to wait for the processes to actually be gone. `terminate` only
@@ -609,10 +794,18 @@ local function menu(cx)
 		-- Launching into a port another program owns only produces a second
 		-- failure, so the blocked state offers the way out instead of a start.
 		table.insert(items, {
-			label = "Port 3080 is taken by another program",
+			label = "Port " .. PORT .. " is taken by another program",
 			icon = "md-alert",
 			act = "noop",
 			detail = state.blocked,
+		})
+		table.insert(items, {
+			label = "Free port " .. PORT .. " and restart",
+			icon = "md-broom",
+			act = "force_restart",
+			detail = state.holder
+				and (holder_label(state.holder) .. "  --  pid " .. (state.holder.PID or "?"))
+				or "look up what is holding it",
 		})
 		table.insert(items, { label = "Check again", icon = "md-refresh", act = "check_port" })
 	else
@@ -655,17 +848,17 @@ local function menu(cx)
 			else
 				open_web_ui(pickCx)
 			end
+		elseif act == "force_restart" then
+			free_port_and_restart(pickCx)
 		elseif act == "check_port" then
 			probe(function(upCx)
 				mark(RUNNING)
 				open_web_ui(upCx)
 			end, function(downCx)
 				mark(STOPPED)
-				downCx:toast("info", "Port 3080 is free", "DSH Web is not running")
+				downCx:toast("info", "Port " .. PORT .. " is free", "DSH Web is not running")
 			end, function(busyCx, why)
-				mark(BLOCKED)
-				state.blocked = why
-				busyCx:toast("error", "Port 3080 still belongs to another program", why)
+				enter_blocked(busyCx, why, "Port " .. PORT .. " still belongs to another program")
 			end)
 		elseif act == "stop" then
 			stop(pickCx)
@@ -723,9 +916,7 @@ local function sync_phase()
 	end, function(fetchCx)
 		mark(STOPPED)
 	end, function(busyCx, why)
-		mark(BLOCKED)
-		state.blocked = why
-		busyCx:toast("error", "Port 3080 belongs to another program", why)
+		enter_blocked(busyCx, why, "Port " .. PORT .. " belongs to another program")
 	end)
 end
 
@@ -759,11 +950,13 @@ local function watch()
 			return
 		end
 		mark(STOPPED)
-	end, function()
+	end, function(heartCx)
 		if state.phase ~= observed then
 			return
 		end
-		mark(BLOCKED)
+		-- No toast: the heartbeat repeats, and a blocked port nobody is looking
+		-- at is not worth interrupting for every few seconds.
+		enter_blocked(heartCx, state.blocked, nil)
 	end)
 end
 

@@ -23,6 +23,9 @@ When the server is stopped, the menu offers only what applies:
   and starts it again on the new version. A newer version available is marked
   with `↑` on the segment.
 - **Up to date** — shows the installed and the latest published version.
+- **Free port 3080 and restart** — offered when something other than DSH holds
+  the port. It names the process and its PID, asks before killing it, and only
+  starts DSH once the port is actually free.
 
 The status line reflects what is actually listening on the port: the segment
 turns from `DSH running` back to `DSH` within seconds of the server going
@@ -138,9 +141,11 @@ token gets recorded.
 
 ## Troubleshooting
 
-**The segment says `DSH` but the port answers.** Something other than DSH
-holds port 3080. The menu reports it as blocked and refuses to start, because
-starting anyway would fail with a confusing error.
+**The segment says `DSH blocked`.** Something other than DSH holds port 3080 —
+often a leftover helper whose parent process died, which keeps the socket and
+answers with a status that is not DSH's. The menu names the holder and offers
+**Free port 3080 and restart**; declining leaves it alone. If the holder is a
+program you are actually using, close it normally instead of killing it.
 
 **A start fails with "gave up waiting".** The log says why. `@deepseek-ai/dsh`
 not installed globally is the usual case, and the message says so. `dsh web`
