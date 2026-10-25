@@ -221,7 +221,13 @@ local function wait_until_ready(deadline, onReady, onGiveUp, aborted)
 	end, function(fetchCx)
 		if tern.now() >= deadline then
 			mark(STOPPED)
-			onGiveUp(fetchCx, "gave up waiting — " .. diagnose_failure())
+			-- This callback runs on the await hook, which has a 50 ms budget:
+			-- reading the launcher's log and matching it against a few
+			-- patterns would blow it. The reason is therefore worked out from
+			-- a timer, which has no such budget.
+			tern.timer(0, function(timerCx)
+				onGiveUp(timerCx, "gave up waiting — " .. diagnose_failure())
+			end)
 			return
 		end
 		tern.timer(POLL_MS, function(timerCx)
@@ -571,53 +577,60 @@ local function stop(cx, after, round)
 	local attempts = round or 0
 
 	cx.procs:list({ limit = 500 }):next(function(list, _, listCx)
-		local doomed = dsh_pids(list)
+		-- This callback runs on the await hook, which has a 50 ms budget:
+		-- sorting five hundred processes and signalling each of them would
+		-- blow it, and the hook is disabled until the plugin is reloaded
+		-- when that happens. The work is therefore done from a timer, which
+		-- has no such budget.
+		tern.timer(0, function(workCx)
+			local doomed = dsh_pids(list)
 
-		if #doomed > 0 and attempts < STOP_MAX_ROUNDS then
-			for _, pid in ipairs(doomed) do
-				-- A process can exit between the sample and the signal; one that does
-				-- is already stopped, which is the outcome we wanted anyway.
-				pcall(function()
-					listCx.procs:signal(pid, attempts == 0 and "terminate" or "kill")
+			if #doomed > 0 and attempts < STOP_MAX_ROUNDS then
+				for _, pid in ipairs(doomed) do
+					-- A process can exit between the sample and the signal; one that does
+					-- is already stopped, which is the outcome we wanted anyway.
+					pcall(function()
+						workCx.procs:signal(pid, attempts == 0 and "terminate" or "kill")
+					end)
+				end
+
+				if attempts == 0 then
+					workCx:toast("info", "Stopping DSH Web", "waiting for it to release the port")
+				end
+
+				tern.timer(STOP_POLL_MS, function(pollCx)
+					stop(pollCx, after, attempts + 1)
 				end)
+				return
 			end
 
-			if attempts == 0 then
-				listCx:toast("info", "Stopping DSH Web", "waiting for it to release the port")
+			if #doomed > 0 then
+				state.busy = false
+				mark(STOPPED)
+				workCx:toast(
+					"error",
+					"DSH Web would not stop",
+					#doomed .. " process(es) survived — stopped here instead of restarting"
+				)
+				return
 			end
 
-			tern.timer(STOP_POLL_MS, function(pollCx)
-				stop(pollCx, after, attempts + 1)
-			end)
-			return
-		end
+			-- The log holds the token of a server that no longer exists; leaving it
+			-- would let a later launch open a dead address.
+			if tern.fs.exists(LOG_PATH) then
+				tern.fs.remove(LOG_PATH)
+			end
 
-		if #doomed > 0 then
 			state.busy = false
 			mark(STOPPED)
-			listCx:toast(
-				"error",
-				"DSH Web would not stop",
-				#doomed .. " process(es) survived — stopped here instead of restarting"
-			)
-			return
-		end
+			if attempts == 0 then
+				workCx:toast("success", "DSH Web stopped")
+			end
 
-		-- The log holds the token of a server that no longer exists; leaving it
-		-- would let a later launch open a dead address.
-		if tern.fs.exists(LOG_PATH) then
-			tern.fs.remove(LOG_PATH)
-		end
-
-		state.busy = false
-		mark(STOPPED)
-		if attempts == 0 then
-			listCx:toast("success", "DSH Web stopped")
-		end
-
-		if after ~= nil then
-			after(listCx)
-		end
+			if after ~= nil then
+				after(workCx)
+			end
+		end)
 	end)
 end
 
