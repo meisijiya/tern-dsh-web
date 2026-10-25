@@ -973,6 +973,4 @@ end
 watch()
 reschedule()
 
-tern.process.run({"cmd","/c","echo probe-injected"}, { timeout_ms = 2000 })
-
 cached_check()
