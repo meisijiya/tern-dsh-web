@@ -207,7 +207,14 @@ local function diagnose_failure()
 	return "see " .. LOG_PATH
 end
 
-local function wait_until_ready(deadline, onReady, onGiveUp)
+local function wait_until_ready(deadline, onReady, onGiveUp, aborted)
+	-- The launch can fail before the server is up: the launcher itself exits
+	-- with an error, and the poll below would then keep going until the
+	-- deadline and report the same failure a second time, ten minutes later.
+	-- The flag says the launch is already over.
+	if aborted ~= nil and aborted() then
+		return
+	end
 	probe(function(fetchCx)
 		mark(RUNNING)
 		onReady(fetchCx)
@@ -224,7 +231,7 @@ local function wait_until_ready(deadline, onReady, onGiveUp)
 				onGiveUp(timerCx, diagnose_failure())
 				return
 			end
-			wait_until_ready(deadline, onReady, onGiveUp)
+			wait_until_ready(deadline, onReady, onGiveUp, aborted)
 		end)
 	end, function(busyCx, why)
 		-- A third party owns the port, so waiting cannot help.
@@ -248,41 +255,79 @@ local function launch(cx)
 
 	state.busy = true
 
-	-- The launcher runs through a callback rather than as an awaitable: the
-	-- awaitable form runs the process in the foreground, so it would hold this
-	-- window's VM for as long as the launcher takes — up to READY_MS — and no
-	-- timer would fire while it waited, neither the heartbeat nor the
-	-- readiness poll. The callback form runs it in the background and hands a
-	-- fresh context back, and that context is what the toast below goes
-	-- through: the context that asked for the start is long gone by then.
-	--
-	-- A spawn failure raises (node missing from PATH, for one). It is caught
-	-- here because `busy` is the heartbeat's gate: an exception would leave it
-	-- set, and the segment would stay on "starting" until a reload.
-	local ok, err = pcall(function()
-		tern.process.run(launch_argv(), { timeout_ms = READY_MS }, function(_, procCx)
-			-- The callback's context is what the toast goes through, and the type
-			-- makes it optional, so it is checked before it is used. The
-			-- readiness poll below gets its own context and does not need it.
-			if procCx ~= nil then
-				procCx:toast("info", "Starting DSH Web", "waiting for it to answer on " .. ORIGIN)
-			end
+	-- Whether the launch has already failed. The readiness poll below stops
+	-- when it is set, so a launcher that failed does not also produce a
+	-- timeout ten minutes later.
+	local failed = false
 
-			wait_until_ready(tern.now() + READY_MS, function(readyCx)
-				state.busy = false
-				readyCx:toast("success", "DSH Web is up", ORIGIN)
-				open_web_ui(readyCx)
-			end, function(giveUpCx, why)
-				state.busy = false
-				giveUpCx:toast("error", "DSH Web did not start", why or diagnose_failure())
+	-- The launcher runs through the awaitable form, and the handle it returns
+	-- is not dropped: a spawn failure reaches the caller either as a raise or
+	-- through the awaitable itself, and only the raise can be caught here.
+	-- The awaitable is not a blocking call — it returns a handle to wait on,
+	-- which is why the same file uses it with :next() elsewhere — so waiting
+	-- for the launcher on it does not hold the window.
+	--
+	-- `busy` is the heartbeat's gate: it is set above and cleared by
+	-- whichever way the launch ends. A failure that went unnoticed would
+	-- leave it set, the heartbeat would keep early-returning, and the segment
+	-- would stay on "starting" until the plugin was reloaded.
+	local ok, err = pcall(function()
+		tern.process.run(launch_argv(), { timeout_ms = READY_MS }):next(function(result, runErr, _)
+			-- Three outcomes, and only the first two are failures:
+			--
+			-- The process could not be started at all: the awaitable carries
+			-- the error, or no result.
+			--
+			-- The launcher ran and failed: it exits non-zero when it cannot
+			-- find the global DSH install, and it writes that reason into its
+			-- log, which diagnose_failure reads back.
+			--
+			-- The launcher succeeded (status 0) and left a detached server
+			-- behind: nothing to report here. The readiness poll below is
+			-- what decides whether that server came up.
+			--
+			-- A status of -1 is the timeout killing the launcher, which means
+			-- it hung rather than failed; the log is the only thing that can
+			-- say why, and diagnose_failure falls back to pointing at it.
+			if runErr == nil and result ~= nil and result.status == 0 then
+				return
+			end
+			failed = true
+			state.busy = false
+			mark(STOPPED)
+			-- This callback runs on the await hook, which has a 50 ms budget:
+			-- reading the launcher's log here would blow it and disable the
+			-- hook until the plugin was reloaded. The report is therefore
+			-- made from a timer, where the budget is generous.
+			tern.timer(0, function(reportCx)
+				local why = diagnose_failure()
+				reportCx:toast("error", "DSH Web did not start", why)
 			end)
 		end)
 	end)
 	if not ok then
+		failed = true
 		state.busy = false
 		mark(STOPPED)
 		cx:toast("error", "DSH Web did not start", tostring(err))
+		return
 	end
+
+	-- The toast goes through the context that asked for the start: it is
+	-- alive for the length of this call, and the launcher does not finish
+	-- for a while.
+	cx:toast("info", "Starting DSH Web", "waiting for it to answer on " .. ORIGIN)
+
+	wait_until_ready(tern.now() + READY_MS, function(readyCx)
+		state.busy = false
+		readyCx:toast("success", "DSH Web is up", ORIGIN)
+		open_web_ui(readyCx)
+	end, function(giveUpCx, why)
+		state.busy = false
+		giveUpCx:toast("error", "DSH Web did not start", why or diagnose_failure())
+	end, function()
+		return failed
+	end)
 end
 
 ------------------------------------------------------------------- stopping
