@@ -31,6 +31,11 @@ local fetchCalls = {}
 -- back with the result.
 local runOutcome = { kind = "ok" }
 
+-- What the launcher's log says. The launcher writes its own failures with a
+-- prefix of its own, so the plugin can tell "the launcher failed" from "the
+-- launcher said nothing".
+local launcherLog = "dsh-web-launcher: @deepseek-ai/dsh is not installed globally"
+
 local function makeCx(name)
 	return {
 		name = name,
@@ -92,7 +97,7 @@ tern = {
 			return true
 		end,
 		read = function()
-			return "dsh-web-launcher: @deepseek-ai/dsh is not installed globally"
+			return launcherLog
 		end,
 		remove = function() end,
 		write = function() end,
@@ -255,6 +260,7 @@ local function reset()
 	processCalls = {}
 	fetchCalls = {}
 	runOutcome = { kind = "ok" }
+	launcherLog = "dsh-web-launcher: @deepseek-ai/dsh is not installed globally"
 	loadPlugin()
 end
 
@@ -319,6 +325,33 @@ for _, toast in ipairs(toasts) do
 end
 eq(sawError, true, "the failure is reported with the launcher's own reason")
 eq(segmentText(), "DSH", "the segment says it is stopped")
+
+print("--- the launcher fails: the report does not wait for the poll ---")
+-- The launcher writes its own failure into its log with a prefix of its
+-- own, and exits non-zero. That reason is reported as soon as the
+-- launcher is done: the readiness poll would otherwise keep going for
+-- another ten minutes and report the same thing a second time.
+reset()
+launcherLog = "dsh-web-launcher: @deepseek-ai/dsh is not installed globally"
+runOutcome = { kind = "fail" }
+startThroughMenu()
+eq(#processCalls, 1, "the launcher ran once")
+runTimers()
+local sawLauncherReason = false
+for _, toast in ipairs(toasts) do
+	if toast.level == "error" and string.find(toast.sub or "", "not installed globally", 1, true) ~= nil then
+		sawLauncherReason = true
+	end
+end
+eq(sawLauncherReason, true, "the launcher's own reason is reported")
+-- The reason is the launcher's, not the generic fallback.
+local sawGeneric = false
+for _, toast in ipairs(toasts) do
+	if toast.level == "error" and string.find(toast.sub or "", "gave up waiting", 1, true) ~= nil then
+		sawGeneric = true
+	end
+end
+eq(sawGeneric, false, "and it did not wait for the poll to time out")
 
 print("--- the process cannot be started at all: the same ---")
 reset()
