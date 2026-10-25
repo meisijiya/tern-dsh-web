@@ -151,6 +151,10 @@ program you are actually using, close it normally instead of killing it.
 not installed globally is the usual case, and the message says so. `dsh web`
 also writes its own logs under `~/.dsh/`.
 
+**A start fails with a spawn error.** The launcher never ran, so the server was
+never asked to start: `node` is not on `PATH`. Put Node.js on `PATH` and start
+again.
+
 **An update fails.** The server is left stopped rather than restarted on a
 half-written install — run `npm i -g @deepseek-ai/dsh@<version>` yourself, see
 what npm says, then start again.

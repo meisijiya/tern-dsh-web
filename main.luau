@@ -248,22 +248,41 @@ local function launch(cx)
 
 	state.busy = true
 
-	-- The awaitable form is used rather than the callback form because the
-	-- callback's context is absent, and a detached start has nothing else to
-	-- toast through: the window context that asked for it is long gone by the
-	-- time the launcher returns.
-	tern.process.run(launch_argv(), { timeout_ms = READY_MS })
+	-- The launcher runs through a callback rather than as an awaitable: the
+	-- awaitable form runs the process in the foreground, so it would hold this
+	-- window's VM for as long as the launcher takes — up to READY_MS — and no
+	-- timer would fire while it waited, neither the heartbeat nor the
+	-- readiness poll. The callback form runs it in the background and hands a
+	-- fresh context back, and that context is what the toast below goes
+	-- through: the context that asked for the start is long gone by then.
+	--
+	-- A spawn failure raises (node missing from PATH, for one). It is caught
+	-- here because `busy` is the heartbeat's gate: an exception would leave it
+	-- set, and the segment would stay on "starting" until a reload.
+	local ok, err = pcall(function()
+		tern.process.run(launch_argv(), { timeout_ms = READY_MS }, function(_, procCx)
+			-- The callback's context is what the toast goes through, and the type
+			-- makes it optional, so it is checked before it is used. The
+			-- readiness poll below gets its own context and does not need it.
+			if procCx ~= nil then
+				procCx:toast("info", "Starting DSH Web", "waiting for it to answer on " .. ORIGIN)
+			end
 
-	cx:toast("info", "Starting DSH Web", "waiting for it to answer on " .. ORIGIN)
-
-	wait_until_ready(tern.now() + READY_MS, function(readyCx)
-		state.busy = false
-		readyCx:toast("success", "DSH Web is up", ORIGIN)
-		open_web_ui(readyCx)
-	end, function(giveUpCx, why)
-		state.busy = false
-		giveUpCx:toast("error", "DSH Web did not start", why or diagnose_failure())
+			wait_until_ready(tern.now() + READY_MS, function(readyCx)
+				state.busy = false
+				readyCx:toast("success", "DSH Web is up", ORIGIN)
+				open_web_ui(readyCx)
+			end, function(giveUpCx, why)
+				state.busy = false
+				giveUpCx:toast("error", "DSH Web did not start", why or diagnose_failure())
+			end)
+		end)
 	end)
+	if not ok then
+		state.busy = false
+		mark(STOPPED)
+		cx:toast("error", "DSH Web did not start", tostring(err))
+	end
 end
 
 ------------------------------------------------------------------- stopping
@@ -360,18 +379,29 @@ local function query_holder(cx, onFound, onFree)
 		tostring(PORT),
 	}
 
-	tern.process.run(argv, { timeout_ms = HOLDER_TIMEOUT_MS }):next(function(result, _, runCx)
-		if result == nil or result.status ~= 0 then
-			onFree(runCx)
-			return
-		end
-		local holder = parse_holder(result.stdout)
-		if holder == nil or tonumber(holder.PID) == nil then
-			onFree(runCx)
-			return
-		end
-		onFound(runCx, holder)
+	-- A spawn failure raises (no powershell, for one), and a holder lookup is
+	-- not worth an exception: the callers read "nobody found" as "nothing is
+	-- holding the port", which is the outcome they already read from a holder
+	-- that exited between the two lookups. An exception would also leave `busy`
+	-- set in the caller that asked for the lookup, and the heartbeat would
+	-- never look at the port again.
+	local ok = pcall(function()
+		tern.process.run(argv, { timeout_ms = HOLDER_TIMEOUT_MS }):next(function(result, _, runCx)
+			if result == nil or result.status ~= 0 then
+				onFree(runCx)
+				return
+			end
+			local holder = parse_holder(result.stdout)
+			if holder == nil or tonumber(holder.PID) == nil then
+				onFree(runCx)
+				return
+			end
+			onFound(runCx, holder)
+		end)
 	end)
+	if not ok then
+		onFree(cx)
+	end
 end
 
 -- Every route into the blocked state goes through here, so the holder is looked
@@ -759,26 +789,36 @@ local function update(cx)
 
 		stopCx:toast("info", "Installing DSH " .. target, "a global install replaces the copy the server runs")
 
-		tern.process.run(argv, { timeout_ms = READY_MS }, function(result, _, procCx)
-			state.busy = false
+		-- A spawn failure raises (npm missing from PATH, for one). It is caught
+		-- here because `busy` is the heartbeat's gate: an exception would leave
+		-- it set, and the heartbeat would never look at the port again.
+		local ok, err = pcall(function()
+			tern.process.run(argv, { timeout_ms = READY_MS }, function(result, _, procCx)
+				state.busy = false
 
-			if result == nil or result.status ~= 0 then
-				mark(STOPPED)
-				local why = result == nil and "npm did not run" or trim(result.stderr or "")
-				procCx:toast(
-					"error",
-					"Could not install DSH " .. target,
-					(why ~= "" and why or "npm exited with " .. tostring(result.status))
-						.. " — DSH Web is stopped"
-				)
-				return
-			end
+				if result == nil or result.status ~= 0 then
+					mark(STOPPED)
+					local why = result == nil and "npm did not run" or trim(result.stderr or "")
+					procCx:toast(
+						"error",
+						"Could not install DSH " .. target,
+						(why ~= "" and why or "npm exited with " .. tostring(result.status))
+							.. " — DSH Web is stopped"
+					)
+					return
+				end
 
-			state.installed = target
-			state.update = ""
-			refresh()
-			launch(procCx)
+				state.installed = target
+				state.update = ""
+				refresh()
+				launch(procCx)
+			end)
 		end)
+		if not ok then
+			state.busy = false
+			mark(STOPPED)
+			stopCx:toast("error", "Could not install DSH " .. target, tostring(err) .. " — DSH Web is stopped")
+		end
 	end)
 end
 
@@ -950,13 +990,17 @@ local function watch()
 			return
 		end
 		mark(STOPPED)
-	end, function(heartCx)
+	end, function(heartCx, why)
 		if state.phase ~= observed then
 			return
 		end
 		-- No toast: the heartbeat repeats, and a blocked port nobody is looking
 		-- at is not worth interrupting for every few seconds.
-		enter_blocked(heartCx, state.blocked, nil)
+		--
+		-- The reason is the one the probe found: `state.blocked` is nil on the
+		-- first block and the reason of an earlier block after that, and the
+		-- menu shows this one as the detail of the blocked row.
+		enter_blocked(heartCx, why, nil)
 	end)
 end
 
@@ -970,7 +1014,23 @@ local function reschedule()
 	end)
 end
 
-watch()
-reschedule()
+-- One heartbeat chain per window. A reload re-runs the entry, and a second
+-- chain would probe the port and refresh the chrome twice every 15 seconds.
+-- Worse, each chain writes into the state table of the run that made it, so an
+-- older chain would keep working on a table the current segment no longer
+-- reads. The guard is the one the sibling plugin uses for its poll chain
+-- (tern-minimax-quota/main.luau), so the pattern is not new here.
+local heartbeat_started = false
+
+local function start_heartbeat()
+	if heartbeat_started then
+		return
+	end
+	heartbeat_started = true
+	watch()
+	reschedule()
+end
+
+start_heartbeat()
 
 cached_check()
