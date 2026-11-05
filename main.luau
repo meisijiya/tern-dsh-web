@@ -490,15 +490,15 @@ local function free_port_and_restart(cx)
 
 		foundCx:pick({
 			placeholder = "Kill pid " .. pid .. "?",
-			icon = "md-alert",
+			icon = "help",
 			items = {
 				{
 					label = "Kill it and start DSH Web",
-					icon = "md-power",
+					icon = "gear",
 					act = "yes",
 					detail = holder_label(holder),
 				},
-				{ label = "Leave it alone", icon = "md-close", act = "no" },
+				{ label = "Leave it alone", icon = "back", act = "no" },
 			},
 		}):next(function(choice, _, pickCx)
 			if choice == nil or choice.act ~= "yes" then
@@ -893,7 +893,7 @@ local function menu(cx)
 		-- failure, so the blocked state offers the way out instead of a start.
 		table.insert(items, {
 			label = "Port " .. PORT .. " is taken by another program",
-			icon = "md-alert",
+			icon = "help",
 			act = "noop",
 			detail = state.blocked,
 		})
@@ -905,12 +905,12 @@ local function menu(cx)
 				and (holder_label(state.holder) .. "  --  pid " .. (state.holder.PID or "?"))
 				or "look up what is holding it",
 		})
-		table.insert(items, { label = "Check again", icon = "md-refresh", act = "check_port" })
+		table.insert(items, { label = "Check again", icon = "refresh", act = "check_port" })
 	else
-		table.insert(items, { label = "Open Web UI", icon = "md-web", act = "open", current = running })
+		table.insert(items, { label = "Open Web UI", icon = "link", act = "open", current = running })
 		if running then
-			table.insert(items, { label = "Restart", icon = "md-refresh", act = "restart" })
-			table.insert(items, { label = "Stop", icon = "md-power", act = "stop" })
+			table.insert(items, { label = "Restart", icon = "refresh", act = "restart" })
+			table.insert(items, { label = "Stop", icon = "gear", act = "stop" })
 		end
 	end
 
@@ -918,24 +918,24 @@ local function menu(cx)
 	-- promise; the user has to see which version is installed and which one the
 	-- registry offers before they can tell whether an update is worth taking.
 	if state.update == nil then
-		table.insert(items, { label = "Check for updates…", icon = "md-cloud-outline", act = "check" })
+		table.insert(items, { label = "Check for updates…", icon = "file", act = "check" })
 	elseif state.update == "" then
 		table.insert(items, {
 			label = "Up to date",
-			icon = "md-check",
+			icon = "check",
 			act = "noop",
 			detail = "installed " .. (state.installed or "unknown") .. " · latest " .. state.latest,
 		})
 	else
 		table.insert(items, {
 			label = "Update to " .. state.update,
-			icon = "md-download",
+			icon = "file",
 			act = "update",
 			detail = "installed " .. (state.installed or "none") .. " → latest " .. state.update,
 		})
 	end
 
-	cx:pick({ items = items, placeholder = "DSH Web", icon = "md-web" }):next(function(choice, _, pickCx)
+	cx:pick({ items = items, placeholder = "DSH Web", icon = "link" }):next(function(choice, _, pickCx)
 		if choice == nil then
 			return
 		end
@@ -993,7 +993,7 @@ tern.chrome.status(function()
 
 	return { {
 		text = label,
-		icon = "md-web",
+		icon = "link",
 		tone = tone,
 		command = "plugin.dsh-web.menu",
 	} }
@@ -1002,7 +1002,7 @@ end)
 tern.command({
 	id = "menu",
 	title = "DSH Web…",
-	icon = "md-web",
+	icon = "link",
 	run = menu,
 })
 
