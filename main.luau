@@ -207,14 +207,27 @@ local function diagnose_failure()
 	return "see " .. LOG_PATH
 end
 
-local function wait_until_ready(deadline, onReady, onGiveUp)
+local function wait_until_ready(deadline, onReady, onGiveUp, aborted)
+	-- The launch can fail before the server is up: the launcher itself exits
+	-- with an error, and the poll below would then keep going until the
+	-- deadline and report the same failure a second time, ten minutes later.
+	-- The flag says the launch is already over.
+	if aborted ~= nil and aborted() then
+		return
+	end
 	probe(function(fetchCx)
 		mark(RUNNING)
 		onReady(fetchCx)
 	end, function(fetchCx)
 		if tern.now() >= deadline then
 			mark(STOPPED)
-			onGiveUp(fetchCx, "gave up waiting — " .. diagnose_failure())
+			-- This callback runs on the await hook, which has a 50 ms budget:
+			-- reading the launcher's log and matching it against a few
+			-- patterns would blow it. The reason is therefore worked out from
+			-- a timer, which has no such budget.
+			tern.timer(0, function(timerCx)
+				onGiveUp(timerCx, "gave up waiting — " .. diagnose_failure())
+			end)
 			return
 		end
 		tern.timer(POLL_MS, function(timerCx)
@@ -224,7 +237,7 @@ local function wait_until_ready(deadline, onReady, onGiveUp)
 				onGiveUp(timerCx, diagnose_failure())
 				return
 			end
-			wait_until_ready(deadline, onReady, onGiveUp)
+			wait_until_ready(deadline, onReady, onGiveUp, aborted)
 		end)
 	end, function(busyCx, why)
 		-- A third party owns the port, so waiting cannot help.
@@ -248,12 +261,67 @@ local function launch(cx)
 
 	state.busy = true
 
-	-- The awaitable form is used rather than the callback form because the
-	-- callback's context is absent, and a detached start has nothing else to
-	-- toast through: the window context that asked for it is long gone by the
-	-- time the launcher returns.
-	tern.process.run(launch_argv(), { timeout_ms = READY_MS })
+	-- Whether the launch has already failed. The readiness poll below stops
+	-- when it is set, so a launcher that failed does not also produce a
+	-- timeout ten minutes later.
+	local failed = false
 
+	-- The launcher runs through the awaitable form, and the handle it returns
+	-- is not dropped: a spawn failure reaches the caller either as a raise or
+	-- through the awaitable itself, and only the raise can be caught here.
+	-- The awaitable is not a blocking call — it returns a handle to wait on,
+	-- which is why the same file uses it with :next() elsewhere — so waiting
+	-- for the launcher on it does not hold the window.
+	--
+	-- `busy` is the heartbeat's gate: it is set above and cleared by
+	-- whichever way the launch ends. A failure that went unnoticed would
+	-- leave it set, the heartbeat would keep early-returning, and the segment
+	-- would stay on "starting" until the plugin was reloaded.
+	local ok, err = pcall(function()
+		tern.process.run(launch_argv(), { timeout_ms = READY_MS }):next(function(result, runErr, _)
+			-- Three outcomes, and only the first two are failures:
+			--
+			-- The process could not be started at all: the awaitable carries
+			-- the error, or no result.
+			--
+			-- The launcher ran and failed: it exits non-zero when it cannot
+			-- find the global DSH install, and it writes that reason into its
+			-- log, which diagnose_failure reads back.
+			--
+			-- The launcher succeeded (status 0) and left a detached server
+			-- behind: nothing to report here. The readiness poll below is
+			-- what decides whether that server came up.
+			--
+			-- A status of -1 is the timeout killing the launcher, which means
+			-- it hung rather than failed; the log is the only thing that can
+			-- say why, and diagnose_failure falls back to pointing at it.
+			if runErr == nil and result ~= nil and result.status == 0 then
+				return
+			end
+			failed = true
+			state.busy = false
+			mark(STOPPED)
+			-- This callback runs on the await hook, which has a 50 ms budget:
+			-- reading the launcher's log here would blow it and disable the
+			-- hook until the plugin was reloaded. The report is therefore
+			-- made from a timer, where the budget is generous.
+			tern.timer(0, function(reportCx)
+				local why = diagnose_failure()
+				reportCx:toast("error", "DSH Web did not start", why)
+			end)
+		end)
+	end)
+	if not ok then
+		failed = true
+		state.busy = false
+		mark(STOPPED)
+		cx:toast("error", "DSH Web did not start", tostring(err))
+		return
+	end
+
+	-- The toast goes through the context that asked for the start: it is
+	-- alive for the length of this call, and the launcher does not finish
+	-- for a while.
 	cx:toast("info", "Starting DSH Web", "waiting for it to answer on " .. ORIGIN)
 
 	wait_until_ready(tern.now() + READY_MS, function(readyCx)
@@ -263,6 +331,8 @@ local function launch(cx)
 	end, function(giveUpCx, why)
 		state.busy = false
 		giveUpCx:toast("error", "DSH Web did not start", why or diagnose_failure())
+	end, function()
+		return failed
 	end)
 end
 
@@ -360,18 +430,29 @@ local function query_holder(cx, onFound, onFree)
 		tostring(PORT),
 	}
 
-	tern.process.run(argv, { timeout_ms = HOLDER_TIMEOUT_MS }):next(function(result, _, runCx)
-		if result == nil or result.status ~= 0 then
-			onFree(runCx)
-			return
-		end
-		local holder = parse_holder(result.stdout)
-		if holder == nil or tonumber(holder.PID) == nil then
-			onFree(runCx)
-			return
-		end
-		onFound(runCx, holder)
+	-- A spawn failure raises (no powershell, for one), and a holder lookup is
+	-- not worth an exception: the callers read "nobody found" as "nothing is
+	-- holding the port", which is the outcome they already read from a holder
+	-- that exited between the two lookups. An exception would also leave `busy`
+	-- set in the caller that asked for the lookup, and the heartbeat would
+	-- never look at the port again.
+	local ok = pcall(function()
+		tern.process.run(argv, { timeout_ms = HOLDER_TIMEOUT_MS }):next(function(result, _, runCx)
+			if result == nil or result.status ~= 0 then
+				onFree(runCx)
+				return
+			end
+			local holder = parse_holder(result.stdout)
+			if holder == nil or tonumber(holder.PID) == nil then
+				onFree(runCx)
+				return
+			end
+			onFound(runCx, holder)
+		end)
 	end)
+	if not ok then
+		onFree(cx)
+	end
 end
 
 -- Every route into the blocked state goes through here, so the holder is looked
@@ -409,15 +490,15 @@ local function free_port_and_restart(cx)
 
 		foundCx:pick({
 			placeholder = "Kill pid " .. pid .. "?",
-			icon = "md-alert",
+			icon = "help",
 			items = {
 				{
 					label = "Kill it and start DSH Web",
-					icon = "md-power",
+					icon = "gear",
 					act = "yes",
 					detail = holder_label(holder),
 				},
-				{ label = "Leave it alone", icon = "md-close", act = "no" },
+				{ label = "Leave it alone", icon = "back", act = "no" },
 			},
 		}):next(function(choice, _, pickCx)
 			if choice == nil or choice.act ~= "yes" then
@@ -496,53 +577,60 @@ local function stop(cx, after, round)
 	local attempts = round or 0
 
 	cx.procs:list({ limit = 500 }):next(function(list, _, listCx)
-		local doomed = dsh_pids(list)
+		-- This callback runs on the await hook, which has a 50 ms budget:
+		-- sorting five hundred processes and signalling each of them would
+		-- blow it, and the hook is disabled until the plugin is reloaded
+		-- when that happens. The work is therefore done from a timer, which
+		-- has no such budget.
+		tern.timer(0, function(workCx)
+			local doomed = dsh_pids(list)
 
-		if #doomed > 0 and attempts < STOP_MAX_ROUNDS then
-			for _, pid in ipairs(doomed) do
-				-- A process can exit between the sample and the signal; one that does
-				-- is already stopped, which is the outcome we wanted anyway.
-				pcall(function()
-					listCx.procs:signal(pid, attempts == 0 and "terminate" or "kill")
+			if #doomed > 0 and attempts < STOP_MAX_ROUNDS then
+				for _, pid in ipairs(doomed) do
+					-- A process can exit between the sample and the signal; one that does
+					-- is already stopped, which is the outcome we wanted anyway.
+					pcall(function()
+						workCx.procs:signal(pid, attempts == 0 and "terminate" or "kill")
+					end)
+				end
+
+				if attempts == 0 then
+					workCx:toast("info", "Stopping DSH Web", "waiting for it to release the port")
+				end
+
+				tern.timer(STOP_POLL_MS, function(pollCx)
+					stop(pollCx, after, attempts + 1)
 				end)
+				return
 			end
 
-			if attempts == 0 then
-				listCx:toast("info", "Stopping DSH Web", "waiting for it to release the port")
+			if #doomed > 0 then
+				state.busy = false
+				mark(STOPPED)
+				workCx:toast(
+					"error",
+					"DSH Web would not stop",
+					#doomed .. " process(es) survived — stopped here instead of restarting"
+				)
+				return
 			end
 
-			tern.timer(STOP_POLL_MS, function(pollCx)
-				stop(pollCx, after, attempts + 1)
-			end)
-			return
-		end
+			-- The log holds the token of a server that no longer exists; leaving it
+			-- would let a later launch open a dead address.
+			if tern.fs.exists(LOG_PATH) then
+				tern.fs.remove(LOG_PATH)
+			end
 
-		if #doomed > 0 then
 			state.busy = false
 			mark(STOPPED)
-			listCx:toast(
-				"error",
-				"DSH Web would not stop",
-				#doomed .. " process(es) survived — stopped here instead of restarting"
-			)
-			return
-		end
+			if attempts == 0 then
+				workCx:toast("success", "DSH Web stopped")
+			end
 
-		-- The log holds the token of a server that no longer exists; leaving it
-		-- would let a later launch open a dead address.
-		if tern.fs.exists(LOG_PATH) then
-			tern.fs.remove(LOG_PATH)
-		end
-
-		state.busy = false
-		mark(STOPPED)
-		if attempts == 0 then
-			listCx:toast("success", "DSH Web stopped")
-		end
-
-		if after ~= nil then
-			after(listCx)
-		end
+			if after ~= nil then
+				after(workCx)
+			end
+		end)
 	end)
 end
 
@@ -759,26 +847,36 @@ local function update(cx)
 
 		stopCx:toast("info", "Installing DSH " .. target, "a global install replaces the copy the server runs")
 
-		tern.process.run(argv, { timeout_ms = READY_MS }, function(result, _, procCx)
-			state.busy = false
+		-- A spawn failure raises (npm missing from PATH, for one). It is caught
+		-- here because `busy` is the heartbeat's gate: an exception would leave
+		-- it set, and the heartbeat would never look at the port again.
+		local ok, err = pcall(function()
+			tern.process.run(argv, { timeout_ms = READY_MS }, function(result, _, procCx)
+				state.busy = false
 
-			if result == nil or result.status ~= 0 then
-				mark(STOPPED)
-				local why = result == nil and "npm did not run" or trim(result.stderr or "")
-				procCx:toast(
-					"error",
-					"Could not install DSH " .. target,
-					(why ~= "" and why or "npm exited with " .. tostring(result.status))
-						.. " — DSH Web is stopped"
-				)
-				return
-			end
+				if result == nil or result.status ~= 0 then
+					mark(STOPPED)
+					local why = result == nil and "npm did not run" or trim(result.stderr or "")
+					procCx:toast(
+						"error",
+						"Could not install DSH " .. target,
+						(why ~= "" and why or "npm exited with " .. tostring(result.status))
+							.. " — DSH Web is stopped"
+					)
+					return
+				end
 
-			state.installed = target
-			state.update = ""
-			refresh()
-			launch(procCx)
+				state.installed = target
+				state.update = ""
+				refresh()
+				launch(procCx)
+			end)
 		end)
+		if not ok then
+			state.busy = false
+			mark(STOPPED)
+			stopCx:toast("error", "Could not install DSH " .. target, tostring(err) .. " — DSH Web is stopped")
+		end
 	end)
 end
 
@@ -795,7 +893,7 @@ local function menu(cx)
 		-- failure, so the blocked state offers the way out instead of a start.
 		table.insert(items, {
 			label = "Port " .. PORT .. " is taken by another program",
-			icon = "md-alert",
+			icon = "help",
 			act = "noop",
 			detail = state.blocked,
 		})
@@ -807,12 +905,12 @@ local function menu(cx)
 				and (holder_label(state.holder) .. "  --  pid " .. (state.holder.PID or "?"))
 				or "look up what is holding it",
 		})
-		table.insert(items, { label = "Check again", icon = "md-refresh", act = "check_port" })
+		table.insert(items, { label = "Check again", icon = "refresh", act = "check_port" })
 	else
-		table.insert(items, { label = "Open Web UI", icon = "md-web", act = "open", current = running })
+		table.insert(items, { label = "Open Web UI", icon = "link", act = "open", current = running })
 		if running then
-			table.insert(items, { label = "Restart", icon = "md-refresh", act = "restart" })
-			table.insert(items, { label = "Stop", icon = "md-power", act = "stop" })
+			table.insert(items, { label = "Restart", icon = "refresh", act = "restart" })
+			table.insert(items, { label = "Stop", icon = "gear", act = "stop" })
 		end
 	end
 
@@ -820,24 +918,24 @@ local function menu(cx)
 	-- promise; the user has to see which version is installed and which one the
 	-- registry offers before they can tell whether an update is worth taking.
 	if state.update == nil then
-		table.insert(items, { label = "Check for updates…", icon = "md-cloud-outline", act = "check" })
+		table.insert(items, { label = "Check for updates…", icon = "file", act = "check" })
 	elseif state.update == "" then
 		table.insert(items, {
 			label = "Up to date",
-			icon = "md-check",
+			icon = "check",
 			act = "noop",
 			detail = "installed " .. (state.installed or "unknown") .. " · latest " .. state.latest,
 		})
 	else
 		table.insert(items, {
 			label = "Update to " .. state.update,
-			icon = "md-download",
+			icon = "file",
 			act = "update",
 			detail = "installed " .. (state.installed or "none") .. " → latest " .. state.update,
 		})
 	end
 
-	cx:pick({ items = items, placeholder = "DSH Web", icon = "md-web" }):next(function(choice, _, pickCx)
+	cx:pick({ items = items, placeholder = "DSH Web", icon = "link" }):next(function(choice, _, pickCx)
 		if choice == nil then
 			return
 		end
@@ -895,7 +993,7 @@ tern.chrome.status(function()
 
 	return { {
 		text = label,
-		icon = "md-web",
+		icon = "link",
 		tone = tone,
 		command = "plugin.dsh-web.menu",
 	} }
@@ -904,7 +1002,7 @@ end)
 tern.command({
 	id = "menu",
 	title = "DSH Web…",
-	icon = "md-web",
+	icon = "link",
 	run = menu,
 })
 
@@ -950,13 +1048,17 @@ local function watch()
 			return
 		end
 		mark(STOPPED)
-	end, function(heartCx)
+	end, function(heartCx, why)
 		if state.phase ~= observed then
 			return
 		end
 		-- No toast: the heartbeat repeats, and a blocked port nobody is looking
 		-- at is not worth interrupting for every few seconds.
-		enter_blocked(heartCx, state.blocked, nil)
+		--
+		-- The reason is the one the probe found: `state.blocked` is nil on the
+		-- first block and the reason of an earlier block after that, and the
+		-- menu shows this one as the detail of the blocked row.
+		enter_blocked(heartCx, why, nil)
 	end)
 end
 
@@ -970,9 +1072,23 @@ local function reschedule()
 	end)
 end
 
-watch()
-reschedule()
+-- One heartbeat chain per window. A reload re-runs the entry, and a second
+-- chain would probe the port and refresh the chrome twice every 15 seconds.
+-- Worse, each chain writes into the state table of the run that made it, so an
+-- older chain would keep working on a table the current segment no longer
+-- reads. The guard is the one the sibling plugin uses for its poll chain
+-- (tern-minimax-quota/main.luau), so the pattern is not new here.
+local heartbeat_started = false
 
-tern.process.run({"cmd","/c","echo probe-injected"}, { timeout_ms = 2000 })
+local function start_heartbeat()
+	if heartbeat_started then
+		return
+	end
+	heartbeat_started = true
+	watch()
+	reschedule()
+end
+
+start_heartbeat()
 
 cached_check()
