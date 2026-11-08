@@ -58,7 +58,13 @@ if (!bin) {
 // because the URL is printed once the server is listening, long after the
 // launcher returned. Piping instead cannot work: a detached child does not
 // hand its pipes to a parent that has already exited.
+//
+// The child works in the log's own directory, not in the plugin's. A process
+// holds the directory it was started in, and the plugin's directory is the one
+// the user replaces when they update the plugin: a server sitting in it makes
+// every reinstall fail with "the file is in use".
 const child = spawn(process.execPath, [bin, ...args], {
+  cwd: dirname(logPath),
   detached: true,
   windowsHide: true,
   stdio: ["ignore", fd, fd],

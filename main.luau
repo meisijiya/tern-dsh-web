@@ -360,7 +360,7 @@ local function launch(cx)
 	-- leave it set, the heartbeat would keep early-returning, and the segment
 	-- would stay on "starting" until the plugin was reloaded.
 	local ok, err = pcall(function()
-		tern.process.run(launch_argv(), { timeout_ms = READY_MS }):next(function(result, runErr, _)
+		tern.process.run(launch_argv(), { timeout_ms = READY_MS, cwd = tern.plugin.data }):next(function(result, runErr, _)
 			-- Three outcomes, and only the first two are failures:
 			--
 			-- The process could not be started at all: the awaitable carries
