@@ -16,7 +16,9 @@ When the server is stopped, the menu offers only what applies:
 ## What it does
 
 - **Open Web UI** — starts the server if it is not running, then opens it in a
-  browser block. An already-healthy browser block is reused rather than stacked.
+  browser block **in a tab of its own**, named `DSH Web`. An already-healthy
+  browser block is reused rather than stacked: the click then brings its tab
+  forward and says `DSH Web is already open`.
 - **Restart** — stops the server and starts it again.
 - **Stop** — stops the server and releases the port.
 - **Update to x.y.z** — stops the server, runs `npm i -g @deepseek-ai/dsh@x.y.z`,
@@ -29,7 +31,9 @@ When the server is stopped, the menu offers only what applies:
 
 The status line reflects what is actually listening on the port: the segment
 turns from `DSH running` back to `DSH` within seconds of the server going
-away, whether it was stopped here or died on its own.
+away, whether it was stopped here or died on its own. A stop in flight says
+`DSH stopping` until the processes are gone, and Restart and Stop stay
+available while it runs.
 
 ## Install
 
@@ -82,7 +86,8 @@ directory moves or the machine changes. Edit the repository, install the copy.
 ## Requirements
 
 - Node.js on `PATH` — the plugin starts the server with `node`.
-- npm — it is asked where the global install lives.
+- npm — it is asked where the global install lives, and only when the
+  remembered answer no longer holds the package.
 - **A global install of DSH**, which is what the server runs:
 
 ```sh
@@ -146,6 +151,18 @@ often a leftover helper whose parent process died, which keeps the socket and
 answers with a status that is not DSH's. The menu names the holder and offers
 **Free port 3080 and restart**; declining leaves it alone. If the holder is a
 program you are actually using, close it normally instead of killing it.
+
+**The segment said `DSH blocked` and then said `DSH running`.** That was a
+false alarm: DSH's own server answers `404` for a moment after it binds the
+port and before its Web UI is mounted. The plugin now asks the OS who holds the
+port before it calls the port blocked, so a server that is still coming up
+reads as `DSH starting`.
+
+**The window said "Plugin error" when it opened.** The plugin used to start a
+process while the window was still loading, and a call that takes longer than
+the host allows is reported that way. Nothing was wrong with the install: the
+plugin pauses for a few seconds and carries on. The load path now starts no
+process at all, and the update check waits for the window to settle first.
 
 **A start fails with "gave up waiting".** The log says why. `@deepseek-ai/dsh`
 not installed globally is the usual case, and the message says so. `dsh web`

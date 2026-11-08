@@ -54,8 +54,14 @@ local STOP_POLL_MS = 400
 local STOP_MAX_ROUNDS = 25
 local FETCH_TIMEOUT_MS = 10_000
 local PROCESS_TIMEOUT_MS = 30_000
+-- The Web UI opens in a tab of its own. The host may create the block a
+-- moment after the open returns, so the pane is looked for again once.
+local OPEN_RETRY_MS = 120
+-- The update check waits for the window to settle before it runs: the
+-- reads and the process spawn it does belong nowhere near the load path.
+local CHECK_DELAY_MS = 2_000
 
-local STOPPED, STARTING, RUNNING, BLOCKED = "stopped", "starting", "running", "blocked"
+local STOPPED, STARTING, RUNNING, BLOCKED, STOPPING = "stopped", "starting", "running", "blocked", "stopping"
 
 local state = {
 	phase = STOPPED,
@@ -153,6 +159,35 @@ end
 
 ------------------------------------------------------------------- opening
 
+-- The pane ids the window had a moment ago. The block a browser open adds
+-- is told apart from the user's own panes by the difference.
+local function pane_ids(cx)
+	local ids = {}
+	for _, pane in ipairs(cx.session:panes()) do
+		ids[pane.pane] = true
+	end
+	return ids
+end
+
+local function fresh_pane(cx, before)
+	for _, pane in ipairs(cx.session:panes()) do
+		if not before[pane.pane] then
+			return pane.pane
+		end
+	end
+	return nil
+end
+
+-- The block moves into a tab of its own, and the tab is named after the
+-- thing it shows: a tab holding a web page otherwise carries the page's own
+-- title, which says nothing about what it is for.
+local function give_own_tab(cx, pane)
+	local tab = cx.layout:move_to_new_tab(pane)
+	if type(tab) == "number" then
+		cx.layout:name_tab(tab, "DSH Web")
+	end
+end
+
 local function open_web_ui(cx)
 	-- Clicking again should reveal the Web UI, not stack up copies of it. An
 	-- existing block is reused only when its page is actually alive: one left
@@ -166,12 +201,33 @@ local function open_web_ui(cx)
 			local read = cx.session:read(pane.pane)
 			if type(read) == "table" and read.kind == "browser" and read.error == nil then
 				cx.layout:focus(pane.pane)
+				cx:toast("info", "DSH Web is already open", "Its tab was brought forward")
 				return
 			end
 		end
 	end
 
-	cx:open(token_url(cx) or ORIGIN)
+	-- The Web UI gets a tab of its own rather than a split beside the cursor.
+	-- A URL open cannot ask for a tab: `cx:open(url, "tab")` still lands in
+	-- the current tab as a split. So the block is opened where it lands and
+	-- then moved into a tab of its own.
+	local url = token_url(cx) or ORIGIN
+	local before = pane_ids(cx)
+	cx:open(url)
+
+	-- The host creates the block before the open returns, on every host
+	-- measured; when it does not, the pane is looked for once more.
+	local fresh = fresh_pane(cx, before)
+	if fresh ~= nil then
+		give_own_tab(cx, fresh)
+		return
+	end
+	tern.timer(OPEN_RETRY_MS, function(retryCx)
+		local late = fresh_pane(retryCx, before)
+		if late ~= nil then
+			give_own_tab(retryCx, late)
+		end
+	end)
 end
 
 -- A launch that fails says why in its log. Reading it turns "it did not come
@@ -215,10 +271,7 @@ local function wait_until_ready(deadline, onReady, onGiveUp, aborted)
 	if aborted ~= nil and aborted() then
 		return
 	end
-	probe(function(fetchCx)
-		mark(RUNNING)
-		onReady(fetchCx)
-	end, function(fetchCx)
+	local function keep_waiting()
 		if tern.now() >= deadline then
 			mark(STOPPED)
 			-- This callback runs on the await hook, which has a 50 ms budget:
@@ -239,10 +292,18 @@ local function wait_until_ready(deadline, onReady, onGiveUp, aborted)
 			end
 			wait_until_ready(deadline, onReady, onGiveUp, aborted)
 		end)
-	end, function(busyCx, why)
-		-- A third party owns the port, so waiting cannot help.
-		mark(STOPPED)
-		onGiveUp(busyCx, why)
+	end
+
+	probe(function(fetchCx)
+		mark(RUNNING)
+		onReady(fetchCx)
+	end, keep_waiting, function(busyCx, why)
+		-- The port answers, but not with the Web UI's 401. DSH's own server
+		-- answers 404 for a moment after it binds the port and before the
+		-- Web UI is mounted, so this is not proof that another program owns
+		-- the port: waiting is the right answer, and the launcher's log says
+		-- when the start really failed.
+		keep_waiting()
 	end)
 end
 
@@ -455,21 +516,64 @@ local function query_holder(cx, onFound, onFree)
 	end
 end
 
--- Every route into the blocked state goes through here, so the holder is looked
--- up once and the menu can name it instead of leaving the user to find out
--- through the task manager.
-local function enter_blocked(cx, why, toastTitle)
+-- Every route into the blocked state goes through here, so the holder is named
+-- in the menu instead of leaving the user to find out through the task
+-- manager. The holder comes from the lookup that decided the port was taken.
+local function enter_blocked(cx, why, toastTitle, holder)
 	mark(BLOCKED)
 	state.blocked = why
-	query_holder(cx, function(heldCx, holder)
-		state.holder = holder
-		refresh()
-	end, function()
-		state.holder = nil
-	end)
+	state.holder = holder
+	refresh()
 	if toastTitle ~= nil then
 		cx:toast("error", toastTitle, why)
 	end
+end
+
+-- The port answers, but not with the Web UI's 401. Two programs can do that:
+-- DSH itself, which answers 404 for a moment after it binds the port and
+-- before its Web UI is mounted, and a program that has nothing to do with
+-- DSH. The holder tells them apart, and only the second one is a port this
+-- plugin cannot use.
+--
+-- The lookup starts a process, and a process started from the load path is
+-- what pushed this plugin past its hook budget: the lookup is made from a
+-- timer instead, which is not on that path. `guard` is asked before anything
+-- is written down, so a result that arrives after the user has moved on
+-- changes nothing.
+local function busy_port(why, blockedTitle, startingTitle, guard)
+	tern.timer(0, function(timerCx)
+		-- The guard is asked before the lookup as well as after it: a
+		-- lookup that starts a process is worth nothing when the answer is
+		-- going to be thrown away.
+		if guard ~= nil and not guard() then
+			return
+		end
+		query_holder(timerCx, function(heldCx, holder)
+			if guard ~= nil and not guard() then
+				return
+			end
+			if holder ~= nil and names_the_package(holder.CMD or "") then
+				-- DSH holds the port and is not serving the Web UI yet.
+				-- A phase that already said "running" is left alone: a
+				-- momentary 404 from a server that is up is not a new state.
+				if state.phase ~= RUNNING then
+					mark(STARTING)
+				end
+				if startingTitle ~= nil then
+					heldCx:toast("info", startingTitle, "the server is up but its Web UI is not answering yet")
+				end
+				return
+			end
+			enter_blocked(heldCx, why, blockedTitle, holder)
+		end, function(freeCx)
+			if guard ~= nil and not guard() then
+				return
+			end
+			-- The holder went away between the answer and the lookup, which is
+			-- the common case rather than an error.
+			enter_blocked(freeCx, why, blockedTitle, nil)
+		end)
+	end)
 end
 
 -- Killing whatever holds the port is destructive to something this plugin did
@@ -568,13 +672,24 @@ end
 -- `after` runs only once nothing is left. Restarting over a survivor would
 -- produce exactly the failure this is here to prevent, so a stuck process is
 -- reported instead.
-local function stop(cx, after, round)
+-- A stop asked for while a stop is running replaces it rather than running
+-- beside it: two escalations would each start a server when they finished,
+-- and the second launch would fail on a port the first one already took.
+local stop_token = 0
+
+local function stop_round(cx, after, attempts, token)
+	-- A newer stop took over: this one has nothing left to do, and it must
+	-- not touch the busy flag the newer one owns. The flag is set below, and
+	-- a stale round that set it would leave the heartbeat muted forever once
+	-- the newer round had already finished.
+	if token ~= stop_token then
+		return
+	end
+
 	-- Held for the whole escalation, including every retry round, and released
 	-- on each exit below. The heartbeat must not read an unreachable port as a
 	-- stopped server while the old one is still being asked to shut down.
 	state.busy = true
-
-	local attempts = round or 0
 
 	cx.procs:list({ limit = 500 }):next(function(list, _, listCx)
 		-- This callback runs on the await hook, which has a 50 ms budget:
@@ -583,9 +698,20 @@ local function stop(cx, after, round)
 		-- when that happens. The work is therefore done from a timer, which
 		-- has no such budget.
 		tern.timer(0, function(workCx)
+			-- A newer stop took over: this one has nothing left to do.
+			if token ~= stop_token then
+				return
+			end
+
 			local doomed = dsh_pids(list)
 
 			if #doomed > 0 and attempts < STOP_MAX_ROUNDS then
+				-- The stop is visible while it happens: the segment says
+				-- "stopping" instead of still claiming to be running.
+				if attempts == 0 then
+					mark(STOPPING)
+				end
+
 				for _, pid in ipairs(doomed) do
 					-- A process can exit between the sample and the signal; one that does
 					-- is already stopped, which is the outcome we wanted anyway.
@@ -599,7 +725,7 @@ local function stop(cx, after, round)
 				end
 
 				tern.timer(STOP_POLL_MS, function(pollCx)
-					stop(pollCx, after, attempts + 1)
+					stop_round(pollCx, after, attempts + 1, token)
 				end)
 				return
 			end
@@ -632,6 +758,11 @@ local function stop(cx, after, round)
 			end
 		end)
 	end)
+end
+
+local function stop(cx, after)
+	stop_token += 1
+	stop_round(cx, after, 0, stop_token)
 end
 
 ------------------------------------------------------------------- updating
@@ -668,31 +799,69 @@ end
 -- On Windows `npm` is an `npm.cmd` shim, so it is spawned through `cmd /c`; a
 -- bare name fails with "program not found".
 local global_root_resolved = false
+local global_root = nil
+local global_root_waiters = {}
+
+-- Where the package lives inside the global root.
+local function package_manifest(root)
+	return root .. "/@deepseek-ai/dsh/package.json"
+end
 
 local function npm_global_root(onDone)
-	local cached = tern.kv.get("npm_global_root")
 	if global_root_resolved then
-		onDone(cached)
+		onDone(global_root)
 		return
 	end
-	global_root_resolved = true
+
+	-- A second caller waits for the first one's answer rather than being told
+	-- the root is unknown.
+	table.insert(global_root_waiters, onDone)
+	if #global_root_waiters > 1 then
+		return
+	end
+
+	local cached = tern.kv.get("npm_global_root")
+
+	local function finish(dir)
+		global_root = dir
+		global_root_resolved = true
+		local waiters = global_root_waiters
+		global_root_waiters = {}
+		for _, waiter in ipairs(waiters) do
+			waiter(dir)
+		end
+	end
+
+	-- The remembered root is used while the package is still in it, and npm is
+	-- asked only when the cache is missing or stale. Asking costs a process
+	-- spawn, and a spawn on the window's load path is what pushed this
+	-- plugin past its hook budget and made it report an error at startup.
+	if cached ~= nil and cached ~= "" and tern.fs.exists(package_manifest(cached)) then
+		finish(cached)
+		return
+	end
 
 	local argv = tern.runtime.os == "windows"
 		and { "cmd", "/c", "npm", "root", "-g" }
 		or { "npm", "root", "-g" }
 
 	tern.process.run(argv, { timeout_ms = PROCESS_TIMEOUT_MS }, function(result, _, procCx)
-		if result == nil or result.status ~= 0 then
-			onDone(cached)
-			return
+		local dir = cached
+		if result ~= nil and result.status == 0 then
+			local out = trim(result.stdout)
+			if out ~= "" then
+				dir = out
+			end
 		end
-		local dir = trim(result.stdout)
-		if dir == "" then
-			onDone(cached)
-			return
-		end
-		tern.kv.set("npm_global_root", dir)
-		onDone(dir)
+		-- This callback runs on the process hook, which has the smallest
+		-- budget of the lot: the cache write and everything the caller does
+		-- with the answer happen in a timer instead.
+		tern.timer(0, function()
+			if dir ~= nil and dir ~= cached then
+				tern.kv.set("npm_global_root", dir)
+			end
+			finish(dir)
+		end)
 	end)
 end
 
@@ -759,7 +928,7 @@ local function installed_version(onDone)
 			onDone(nil)
 			return
 		end
-		local manifest = root .. "/@deepseek-ai/dsh/package.json"
+		local manifest = package_manifest(root)
 		if not tern.fs.exists(manifest) then
 			onDone(nil)
 			return
@@ -801,19 +970,24 @@ local function check_update(announce, onVerdict)
 			end
 			return
 		end
-		installed_version(function(installed)
-			settle_update(latest, installed)
-			if onVerdict ~= nil then
-				onVerdict(true)
-			end
-			if not announce then
-				return
-			end
-			if state.update == "" then
-				latestCx:toast("success", "DSH is up to date", state.installed)
-			else
-				latestCx:toast("info", "DSH update available", (state.installed or "not installed") .. " → " .. state.update)
-			end
+		-- The reads and the chrome refresh belong on a timer: the fetch
+		-- callback runs on the await hook, whose budget is small, and a
+		-- window that is still loading is the worst moment to spend it.
+		tern.timer(0, function(timerCx)
+			installed_version(function(installed)
+				settle_update(latest, installed)
+				if onVerdict ~= nil then
+					onVerdict(true)
+				end
+				if not announce then
+					return
+				end
+				if state.update == "" then
+					timerCx:toast("success", "DSH is up to date", state.installed)
+				else
+					timerCx:toast("info", "DSH update available", (state.installed or "not installed") .. " → " .. state.update)
+				end
+			end)
 		end)
 	end)
 end
@@ -883,7 +1057,12 @@ end
 ---------------------------------------------------------------------- menu
 
 local function menu(cx)
-	local running = state.phase == RUNNING or state.phase == STARTING
+	-- A stop in flight still leaves the server up until the processes are
+	-- gone, so Restart and Stop stay offered while it runs: the user may want
+	-- to restart again or to insist. What is not current then is the Web UI,
+	-- which is on its way out.
+	local running = state.phase == RUNNING or state.phase == STARTING or state.phase == STOPPING
+	local current = state.phase == RUNNING or state.phase == STARTING
 	local blocked = state.phase == BLOCKED
 
 	local items = {}
@@ -907,7 +1086,7 @@ local function menu(cx)
 		})
 		table.insert(items, { label = "Check again", icon = "refresh", act = "check_port" })
 	else
-		table.insert(items, { label = "Open Web UI", icon = "link", act = "open", current = running })
+		table.insert(items, { label = "Open Web UI", icon = "link", act = "open", current = current })
 		if running then
 			table.insert(items, { label = "Restart", icon = "refresh", act = "restart" })
 			table.insert(items, { label = "Stop", icon = "gear", act = "stop" })
@@ -956,7 +1135,7 @@ local function menu(cx)
 				mark(STOPPED)
 				downCx:toast("info", "Port " .. PORT .. " is free", "DSH Web is not running")
 			end, function(busyCx, why)
-				enter_blocked(busyCx, why, "Port " .. PORT .. " still belongs to another program")
+				busy_port(why, "Port " .. PORT .. " still belongs to another program", "DSH Web is starting")
 			end)
 		elseif act == "stop" then
 			stop(pickCx)
@@ -984,7 +1163,7 @@ tern.chrome.status(function()
 	local tone = "muted"
 	if state.phase == RUNNING then
 		tone = "success"
-	elseif state.phase == STARTING or state.phase == BLOCKED then
+	elseif state.phase == STARTING or state.phase == STOPPING or state.phase == BLOCKED then
 		tone = "warning"
 	end
 	if state.update ~= nil and state.update ~= "" and state.phase ~= BLOCKED then
@@ -1014,7 +1193,7 @@ local function sync_phase()
 	end, function(fetchCx)
 		mark(STOPPED)
 	end, function(busyCx, why)
-		enter_blocked(busyCx, why, "Port " .. PORT .. " belongs to another program")
+		busy_port(why, "Port " .. PORT .. " belongs to another program", nil)
 	end)
 end
 
@@ -1049,16 +1228,15 @@ local function watch()
 		end
 		mark(STOPPED)
 	end, function(heartCx, why)
-		if state.phase ~= observed then
-			return
-		end
 		-- No toast: the heartbeat repeats, and a blocked port nobody is looking
 		-- at is not worth interrupting for every few seconds.
 		--
 		-- The reason is the one the probe found: `state.blocked` is nil on the
 		-- first block and the reason of an earlier block after that, and the
 		-- menu shows this one as the detail of the blocked row.
-		enter_blocked(heartCx, why, nil)
+		busy_port(why, nil, nil, function()
+			return state.phase == observed
+		end)
 	end)
 end
 
@@ -1091,4 +1269,9 @@ end
 
 start_heartbeat()
 
-cached_check()
+-- The update check is not on the load path. It reads the registry, may have
+-- to ask npm where the package lives, and refreshes the chrome, and none of
+-- that belongs in the middle of a window that is still coming up. The wait
+-- also gives the server time to answer, so the first probe of the heartbeat
+-- is not the one that decides the phase.
+tern.timer(CHECK_DELAY_MS, cached_check)

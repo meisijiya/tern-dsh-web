@@ -9,3 +9,6 @@ secrets.luau
 # Luau / editor
 *.bak
 .cache/
+
+# The DSH server writes its own cache next to whatever it was started from.
+.dsh-mattskillsdeck-cache/
