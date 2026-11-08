@@ -16,7 +16,10 @@ When the server is stopped, the menu offers only what applies:
 ## What it does
 
 - **Open Web UI** — starts the server if it is not running, then opens it in a
-  browser block. An already-healthy browser block is reused rather than stacked.
+  browser block **in a tab of its own**, named `DSH Web`. An already-healthy
+  browser block is reused rather than stacked: the click brings its tab
+  forward — giving it a tab of its own again when it no longer has one — and
+  says `DSH Web is already open`.
 - **Restart** — stops the server and starts it again.
 - **Stop** — stops the server and releases the port.
 - **Update to x.y.z** — stops the server, runs `npm i -g @deepseek-ai/dsh@x.y.z`,
@@ -29,7 +32,9 @@ When the server is stopped, the menu offers only what applies:
 
 The status line reflects what is actually listening on the port: the segment
 turns from `DSH running` back to `DSH` within seconds of the server going
-away, whether it was stopped here or died on its own.
+away, whether it was stopped here or died on its own. A stop in flight says
+`DSH stopping` until the processes are gone, and Restart and Stop stay
+available while it runs.
 
 ## Install
 
@@ -72,7 +77,8 @@ tern plugin install "D:/path/to/tern-dsh-web" --force
 one that is already there.
 
 The repository keeps only sources. Nothing is written into it at runtime: the
-server's log and any plugin state live under Tern's own plugin-data directory.
+server's log, its working directory and any plugin state live under Tern's own
+plugin-data directory.
 
 **Do not develop this with `tern plugin link`.** Linking runs the directory in
 place instead of copying it, which makes it ambiguous which tree a running
@@ -82,7 +88,8 @@ directory moves or the machine changes. Edit the repository, install the copy.
 ## Requirements
 
 - Node.js on `PATH` — the plugin starts the server with `node`.
-- npm — it is asked where the global install lives.
+- npm — it is asked where the global install lives, and only when the
+  remembered answer no longer holds the package.
 - **A global install of DSH**, which is what the server runs:
 
 ```sh
@@ -147,6 +154,18 @@ answers with a status that is not DSH's. The menu names the holder and offers
 **Free port 3080 and restart**; declining leaves it alone. If the holder is a
 program you are actually using, close it normally instead of killing it.
 
+**The segment said `DSH blocked` and then said `DSH running`.** That was a
+false alarm: DSH's own server answers `404` for a moment after it binds the
+port and before its Web UI is mounted. The plugin now asks the OS who holds the
+port before it calls the port blocked, so a server that is still coming up
+reads as `DSH starting`.
+
+**The window said "Plugin error" when it opened.** The plugin used to start a
+process while the window was still loading, and a call that takes longer than
+the host allows is reported that way. Nothing was wrong with the install: the
+plugin pauses for a few seconds and carries on. The load path now starts no
+process at all, and the update check waits for the window to settle first.
+
 **A start fails with "gave up waiting".** The log says why. `@deepseek-ai/dsh`
 not installed globally is the usual case, and the message says so. `dsh web`
 also writes its own logs under `~/.dsh/`.
@@ -161,6 +180,13 @@ what npm says, then start again.
 
 **The version check says "checking…" forever.** The registry request failed.
 The reason is shown in the toast.
+
+**Installing the plugin fails with "the file is in use" (os error 32).** A
+server started by an older version worked in the plugin's own folder, and a
+process holds the folder it works in, so the folder could not be replaced.
+Stop the server (**Stop** in the menu, or restart it — a server started now
+works in the plugin-data directory and never holds the plugin's folder) and
+install again.
 
 ## License
 
