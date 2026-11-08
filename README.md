@@ -77,7 +77,8 @@ tern plugin install "D:/path/to/tern-dsh-web" --force
 one that is already there.
 
 The repository keeps only sources. Nothing is written into it at runtime: the
-server's log and any plugin state live under Tern's own plugin-data directory.
+server's log, its working directory and any plugin state live under Tern's own
+plugin-data directory.
 
 **Do not develop this with `tern plugin link`.** Linking runs the directory in
 place instead of copying it, which makes it ambiguous which tree a running
@@ -179,6 +180,13 @@ what npm says, then start again.
 
 **The version check says "checking…" forever.** The registry request failed.
 The reason is shown in the toast.
+
+**Installing the plugin fails with "the file is in use" (os error 32).** A
+server started by an older version worked in the plugin's own folder, and a
+process holds the folder it works in, so the folder could not be replaced.
+Stop the server (**Stop** in the menu, or restart it — a server started now
+works in the plugin-data directory and never holds the plugin's folder) and
+install again.
 
 ## License
 
