@@ -188,6 +188,17 @@ local function give_own_tab(cx, pane)
 	end
 end
 
+-- How many blocks a tab holds. A block that is alone in one already has the
+-- tab it wants; one that shares a tab with other blocks does not.
+local function tab_pane_count(cx, tab)
+	for _, info in ipairs(cx.session:tabs()) do
+		if info.id == tab then
+			return info.panes
+		end
+	end
+	return nil
+end
+
 local function open_web_ui(cx)
 	-- Clicking again should reveal the Web UI, not stack up copies of it. An
 	-- existing block is reused only when its page is actually alive: one left
@@ -200,8 +211,18 @@ local function open_web_ui(cx)
 		if pane.kind == "browser" and pane.url ~= nil and string.sub(pane.url, 1, #ORIGIN) == ORIGIN then
 			local read = cx.session:read(pane.pane)
 			if type(read) == "table" and read.kind == "browser" and read.error == nil then
-				cx.layout:focus(pane.pane)
-				cx:toast("info", "DSH Web is already open", "Its tab was brought forward")
+				-- The block is only useful to the user when it can be seen. A
+				-- block in the deck (a closed tab parks it) or one sharing a
+				-- tab with other blocks is given a tab of its own first;
+				-- focusing it alone would leave the user looking at nothing.
+				local alone = pane.tab ~= nil and tab_pane_count(cx, pane.tab) == 1
+				if alone then
+					cx.layout:focus(pane.pane)
+					cx:toast("info", "DSH Web is already open", "Its tab was brought forward")
+				else
+					give_own_tab(cx, pane.pane)
+					cx:toast("info", "DSH Web is already open", "It was given a tab of its own")
+				end
 				return
 			end
 		end

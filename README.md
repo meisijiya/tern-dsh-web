@@ -17,8 +17,9 @@ When the server is stopped, the menu offers only what applies:
 
 - **Open Web UI** — starts the server if it is not running, then opens it in a
   browser block **in a tab of its own**, named `DSH Web`. An already-healthy
-  browser block is reused rather than stacked: the click then brings its tab
-  forward and says `DSH Web is already open`.
+  browser block is reused rather than stacked: the click brings its tab
+  forward — giving it a tab of its own again when it no longer has one — and
+  says `DSH Web is already open`.
 - **Restart** — stops the server and starts it again.
 - **Stop** — stops the server and releases the port.
 - **Update to x.y.z** — stops the server, runs `npm i -g @deepseek-ai/dsh@x.y.z`,

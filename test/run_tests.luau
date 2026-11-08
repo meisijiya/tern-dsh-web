@@ -90,6 +90,9 @@ local dshDiesOnSignal = false
 local panes = {}
 local nextPaneId = 100
 
+-- The window's tabs, so a block can be found alone in one or sharing one.
+local tabInfos = {}
+
 -- What the plugin asked the host to do with its layout.
 local openedUrls = {}
 local movedPanes = {}
@@ -136,6 +139,9 @@ local function makeCx(name)
 			panes = function()
 				return panes
 			end,
+			tabs = function()
+				return tabInfos
+			end,
 			-- A browser block that has loaded reads back as a browser block.
 			-- The server's own pane has no text to read in the harness.
 			read = function(_, pane)
@@ -154,10 +160,22 @@ local function makeCx(name)
 			end,
 			move_to_new_tab = function(self, pane)
 				table.insert(movedPanes, pane)
-				return 900 + #movedPanes
+				local tab = 900 + #movedPanes
+				for _, info in ipairs(panes) do
+					if info.pane == pane then
+						info.tab = tab
+					end
+				end
+				table.insert(tabInfos, { id = tab, panes = 1 })
+				return tab
 			end,
 			name_tab = function(self, tab, name)
 				table.insert(namedTabs, { tab = tab, name = name })
+				for _, info in ipairs(tabInfos) do
+					if info.id == tab then
+						info.name = name
+					end
+				end
 			end,
 		},
 		-- The plugin asks the host for the process list when it wants to know
@@ -426,6 +444,7 @@ local function reset()
 	focusedPanes = {}
 	panes = {}
 	nextPaneId = 100
+	tabInfos = {}
 	kvStore = {}
 	dshAlive = true
 	dshDiesOnSignal = false
@@ -653,6 +672,36 @@ for _, toast in ipairs(toasts) do
 	end
 end
 eq(sawAlreadyOpen, true, "the click was answered")
+
+print("--- a block that is no longer on screen is given a tab again ---")
+reset()
+portStatus = 401
+loadPlugin()
+runMenu("open")
+-- A closed tab parks the block in the deck: it is alive, but the user
+-- cannot see it, and focusing it alone would show nothing.
+panes[1].parked = true
+panes[1].tab = nil
+tabInfos = {}
+runMenu("open")
+eq(#openedUrls, 1, "no second block was opened")
+eq(#movedPanes, 2, "the parked block was given a tab of its own")
+eq(movedPanes[2], 101, "and it was the block that was already open")
+eq(namedTabs[2] and namedTabs[2].name or "", "DSH Web", "and the tab was named after it")
+
+print("--- a block sharing a tab is given one of its own ---")
+reset()
+portStatus = 401
+loadPlugin()
+runMenu("open")
+-- A block the user opened by hand sits beside other blocks; the plugin's
+-- Web UI belongs in a tab of its own.
+panes[1].tab = 500
+table.insert(tabInfos, { id = 500, panes = 2 })
+runMenu("open")
+eq(#openedUrls, 1, "no second block was opened")
+eq(#movedPanes, 2, "the block was moved out of the shared tab")
+eq(namedTabs[2] and namedTabs[2].name or "", "DSH Web", "and the new tab was named")
 
 print("--- a port DSH itself holds is starting, not blocked ---")
 reset()
